@@ -5,6 +5,9 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#ifdef _WIN32
+#include "compat/win32/platform.h"
+#endif
 
 #define CHECK(x) do { if (!(x)) { fprintf(stderr, "%s:%d: %s\n", __FILE__, __LINE__, #x); exit(1); } } while (0)
 enum { EXPERTS = 8, LAYERS = 3, ROWS = 129 };
@@ -50,7 +53,12 @@ static void run(unsigned gate_type, unsigned down_type, unsigned dim, unsigned s
             }
         }
     }
+#ifdef _WIN32
+    char path[32768];
+    CHECK(ds4_win32_temp_path(path, sizeof(path), "ds4-ssd-cache-XXXXXX") == 0);
+#else
     char path[] = "/tmp/ds4-ssd-cache-XXXXXX";
+#endif
     int fd = mkstemp(path);
     CHECK(fd >= 0 && unlink(path) == 0 && write(fd, model, model_bytes) == (ssize_t)model_bytes);
     CHECK(ds4_gpu_init());

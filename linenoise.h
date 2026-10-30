@@ -123,6 +123,15 @@ void linenoiseShow(struct linenoiseState *l);
 void linenoiseBeginUpdate(int fd);
 void linenoiseEndUpdate(void);
 int linenoiseWrite(int fd, const char *text, size_t len);
+#ifdef _WIN32
+/* UI-thread-only native console input, translated to UTF-8 and ANSI keys.
+ * Returns a byte count, 0 at EOF, or -1 with errno. With nonblock set,
+ * EAGAIN means drained (including non-key events); pending repeats and UTF-8
+ * bytes are drained before reading another console event. Pipes/files use
+ * descriptor I/O; nonblock also checks pipe availability without consuming.
+ * Use this rather than read() when an outer event loop queues console input. */
+int linenoiseWindowsReadInput(int fd, char *buf, size_t len, int nonblock);
+#endif
 /* Repaint only the footer if its geometry and absolute cursor are known. */
 int linenoiseRefreshStatus(struct linenoiseState *l);
 size_t linenoiseUtf8Decode(const char *text, size_t len, uint32_t *cp);
@@ -145,6 +154,9 @@ void linenoiseAddCompletion(linenoiseCompletions *, const char *);
 /* History API. */
 int linenoiseHistoryAdd(const char *line);
 int linenoiseHistorySetMaxLen(int len);
+/* Windows saves use a protected, current-user-only ACL before truncation.
+ * Existing files owned by another user, reparse points, filesystems without
+ * enforceable ACLs, and security/write failures return -1 with errno. */
 int linenoiseHistorySave(const char *filename);
 int linenoiseHistoryLoad(const char *filename);
 
@@ -154,7 +166,10 @@ void linenoiseSetMultiLine(int ml);
 void linenoisePrintKeyCodes(void);
 void linenoiseMaskModeEnable(void);
 void linenoiseMaskModeDisable(void);
-/* Re-enable raw mode if a child process changed the terminal state. */
+/* Re-enable raw mode if a child process changed the terminal state.
+ * Windows saves/restores both console modes and code pages for each edit;
+ * Ctrl+C remains input to the editor, and process termination controls restore
+ * the original console state before normal control-handler dispatch. */
 void linenoiseRestoreRawMode(void);
 
 #ifdef __cplusplus

@@ -257,6 +257,7 @@ DGX Spark results, comparison conditions, and benchmark commands.
 - [Coding agent clients](docs/CLIENTS.md): Pi, OpenCode, Codex CLI, and Claude Code.
 - [Performance](docs/PERFORMANCE.md): reproducible measurements and recorded baselines.
 - [Testing and development](docs/TESTING.md): regression tests, debugging, and model-building tools.
+- [Native Windows ARM64 development](docs/WINDOWS.md): experimental port, toolchain checks, and validation limits.
 
 Read [CONTRIBUTING.md](CONTRIBUTING.md) before sending a pull request.
 

@@ -31,8 +31,14 @@
 #include <string.h>
 #include <strings.h>
 #include <pthread.h>
+#ifdef _WIN32
+#include <windows.h>
+#include <io.h>
+#include "linenoise.h"
+#else
 #include <sys/ioctl.h>
 #include <termios.h>
+#endif
 #include <time.h>
 #include <unistd.h>
 
@@ -1314,7 +1320,14 @@ typedef struct {
     volatile sig_atomic_t running;
     pthread_t thread;
     pthread_mutex_t mu;
+#ifdef _WIN32
+    HANDLE input_handle, output_handle;
+    DWORD input_mode, output_mode;
+    UINT output_codepage;
+    bool output_changed;
+#else
     struct termios orig_termios;
+#endif
     int move_delta;
     bool enter_pressed;
     bool pause_pressed;
@@ -1837,6 +1850,16 @@ static eval_config parse_options(int argc, char **argv) {
 }
 
 static int terminal_size(int *cols, int *rows) {
+#ifdef _WIN32
+    CONSOLE_SCREEN_BUFFER_INFO info;
+    if (!GetConsoleScreenBufferInfo((HANDLE)_get_osfhandle(STDOUT_FILENO), &info)) {
+        *cols = 80;
+        *rows = 24;
+        return -1;
+    }
+    *cols = info.srWindow.Right - info.srWindow.Left + 1;
+    *rows = info.srWindow.Bottom - info.srWindow.Top + 1;
+#else
     struct winsize ws;
     if (ioctl(STDOUT_FILENO, TIOCGWINSZ, &ws) != 0 || ws.ws_col == 0 || ws.ws_row == 0) {
         *cols = 80;
@@ -1845,6 +1868,7 @@ static int terminal_size(int *cols, int *rows) {
     }
     *cols = ws.ws_col;
     *rows = ws.ws_row;
+#endif
     return 0;
 }
 
@@ -1979,7 +2003,11 @@ static void *input_thread_main(void *arg) {
     char buf[64];
 
     while (global_input.running) {
+#ifdef _WIN32
+        ssize_t n = linenoiseWindowsReadInput(STDIN_FILENO, buf, sizeof(buf), 1);
+#else
         ssize_t n = read(STDIN_FILENO, buf, sizeof(buf));
+#endif
         if (n <= 0) {
             usleep(5000);
             continue;
@@ -2001,8 +2029,32 @@ static void *input_thread_main(void *arg) {
     return NULL;
 }
 
+static void tui_restore_input_mode(void) {
+#ifdef _WIN32
+    SetConsoleMode(global_input.input_handle, global_input.input_mode);
+#else
+    tcsetattr(STDIN_FILENO, TCSANOW, &global_input.orig_termios);
+#endif
+}
+
+#ifdef _WIN32
+static void tui_restore_output_mode(void) {
+    if (!global_input.output_changed) return;
+    SetConsoleOutputCP(global_input.output_codepage);
+    SetConsoleMode(global_input.output_handle, global_input.output_mode);
+    global_input.output_changed = false;
+}
+#endif
+
 static void tui_start_input(void) {
     if (!isatty(STDIN_FILENO)) return;
+#ifdef _WIN32
+    global_input.input_handle = (HANDLE)_get_osfhandle(STDIN_FILENO);
+    if (!GetConsoleMode(global_input.input_handle, &global_input.input_mode)) return;
+    if (!SetConsoleMode(global_input.input_handle,
+                        global_input.input_mode &
+                        ~(ENABLE_LINE_INPUT | ENABLE_ECHO_INPUT | ENABLE_VIRTUAL_TERMINAL_INPUT))) return;
+#else
     if (tcgetattr(STDIN_FILENO, &global_input.orig_termios) != 0) return;
 
     /* The input thread is intentionally boring: it never writes to the terminal,
@@ -2015,6 +2067,7 @@ static void tui_start_input(void) {
     raw.c_cc[VMIN] = 0;
     raw.c_cc[VTIME] = 1;
     if (tcsetattr(STDIN_FILENO, TCSANOW, &raw) != 0) return;
+#endif
 
     pthread_mutex_lock(&global_input.mu);
     global_input.move_delta = 0;
@@ -2031,7 +2084,7 @@ static void tui_start_input(void) {
     } else {
         global_input.running = 0;
         global_input.enabled = false;
-        tcsetattr(STDIN_FILENO, TCSANOW, &global_input.orig_termios);
+        tui_restore_input_mode();
         global_input.raw_mode = false;
     }
 }
@@ -2043,7 +2096,7 @@ static void tui_stop_input(void) {
         global_input.thread_started = false;
     }
     if (global_input.raw_mode) {
-        tcsetattr(STDIN_FILENO, TCSANOW, &global_input.orig_termios);
+        tui_restore_input_mode();
         global_input.raw_mode = false;
     }
     global_input.enabled = false;
@@ -2102,6 +2155,9 @@ static void tui_restore(void) {
     fputs(ANSI_RESET "\x1b[?25h\x1b[?1049l", stdout);
     fflush(stdout);
     ui->active = false;
+#ifdef _WIN32
+    tui_restore_output_mode();
+#endif
 }
 
 static void tui_signal_restore(int sig) {
@@ -2112,7 +2168,7 @@ static void tui_signal_restore(int sig) {
     eval_ui *ui = global_ui;
     global_input.running = 0;
     if (global_input.raw_mode) {
-        tcsetattr(STDIN_FILENO, TCSANOW, &global_input.orig_termios);
+        tui_restore_input_mode();
         global_input.raw_mode = false;
     }
     if (ui && ui->active) {
@@ -2120,6 +2176,9 @@ static void tui_signal_restore(int sig) {
         if (write(STDOUT_FILENO, restore, sizeof(restore) - 1) == -1) {}
         ui->active = false;
     }
+#ifdef _WIN32
+    tui_restore_output_mode();
+#endif
     signal(sig, SIG_DFL);
     raise(sig);
 }
@@ -2471,6 +2530,23 @@ static void tui_start(eval_ui *ui, const eval_case *cases, int ncases, int max_t
     ui->right_w = ui->cols - ui->right_x + 1;
     ui->body_y = 6;
     ui->body_h = ui->rows - ui->body_y + 1;
+
+#ifdef _WIN32
+    global_input.output_handle = (HANDLE)_get_osfhandle(STDOUT_FILENO);
+    if (!GetConsoleMode(global_input.output_handle, &global_input.output_mode) ||
+        !SetConsoleMode(global_input.output_handle,
+                        global_input.output_mode | ENABLE_VIRTUAL_TERMINAL_PROCESSING)) {
+        ui->enabled = false;
+        return;
+    }
+    global_input.output_codepage = GetConsoleOutputCP();
+    if (!SetConsoleOutputCP(CP_UTF8)) {
+        SetConsoleMode(global_input.output_handle, global_input.output_mode);
+        ui->enabled = false;
+        return;
+    }
+    global_input.output_changed = true;
+#endif
 
     global_ui = ui;
     atexit(tui_restore);

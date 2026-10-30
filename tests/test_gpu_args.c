@@ -31,11 +31,16 @@ int main(void) {
         bool skip = false;
         err[0] = '\0';
         int rc = parse_gpu_vram_arg("40,12", NULL, &cfg, &skip, err, sizeof(err));
+#ifdef _WIN32
+        PASS_FAIL("parse 40,12 rejects Windows multi-GPU",
+                  rc != 0 && strstr(err, "not supported on Windows") != NULL);
+#else
         PASS_FAIL("parse 40,12 returns 0",
                   rc == 0 && !skip && cfg.n_gpus == 2 &&
                   cfg.device_indices[0] == 0 && cfg.device_indices[1] == 1 &&
                   cfg.vram_bytes[0] == (size_t)40 * 1024 * 1024 * 1024 &&
                   cfg.vram_bytes[1] == (size_t)12 * 1024 * 1024 * 1024);
+#endif
     }
 
     /* 2: single-GPU */
@@ -82,8 +87,13 @@ int main(void) {
         ds4_gpu_config cfg = (ds4_gpu_config){0};
         bool skip = false;
         int rc = parse_gpu_vram_arg("40,12,40", "0,2", &cfg, &skip, err, sizeof(err));
+#ifdef _WIN32
+        PASS_FAIL("parse multi-device filter rejects Windows multi-GPU",
+                  rc != 0 && strstr(err, "not supported on Windows") != NULL);
+#else
         PASS_FAIL("parse 40,12,40 with devs 0,2 errors on count",
                   rc != 0 && strstr(err, "count") != NULL);
+#endif
     }
 
     /* 6: garbage value */
@@ -99,11 +109,16 @@ int main(void) {
         ds4_gpu_config cfg = (ds4_gpu_config){0};
         bool skip = false;
         int rc = parse_gpu_vram_arg("40,12", "0,2", &cfg, &skip, err, sizeof(err));
+#ifdef _WIN32
+        PASS_FAIL("parse 40,12 + devices 0,2 rejects Windows multi-GPU",
+                  rc != 0 && strstr(err, "not supported on Windows") != NULL);
+#else
         PASS_FAIL("parse 40,12 + devices 0,2",
                   rc == 0 && !skip && cfg.n_gpus == 2 &&
                   cfg.device_indices[0] == 0 && cfg.device_indices[1] == 2 &&
                   cfg.vram_bytes[0] == (size_t)40 * 1024 * 1024 * 1024 &&
                   cfg.vram_bytes[1] == (size_t)12 * 1024 * 1024 * 1024);
+#endif
     }
 
     /* 8: --gpu-vram 0 with --gpu-devices → error */

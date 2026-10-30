@@ -11,7 +11,13 @@
 # Model and test payloads are scored byte-for-byte: never EOL-normalize them.
 # (These stay diffable, unlike the true binaries below.)
 gguf-tools/quality-testing/data/** -text
+# Curated DeepSeek collections also live beside data/.
+gguf-tools/quality-testing/deepseek-*/** -text
+gguf-tools/quality-testing/prompts.jsonl -text
 tests/test-vectors/** -text
+tests/long_context_*_prompt.txt -text
+tests/vision-fixtures/**/*.json -text
+speed-bench/promessi_sposi.txt -text
 *.vec -text
 *.tsv -text
 
@@ -27,4 +33,4 @@ tests/test-vectors/** -text
 
 # Preserve hosted-model continuation bytes exactly; these fixtures may contain
 # model-generated trailing whitespace that is meaningful to tokenizer scoring.
-gguf-tools/quality-testing/data/*/continuations/*.txt -diff
+gguf-tools/quality-testing/**/continuations/*.txt -diff

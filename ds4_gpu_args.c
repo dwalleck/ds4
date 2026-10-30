@@ -3,7 +3,8 @@
  * See ds4_gpu_args.h. The actual CUDA probing for the "auto" branch
  * lives in ds4_cuda.cu so this .c file never includes <cuda_runtime.h>
  * directly (mirroring the rest of the tree's separation between .c and
- * .cu compilation units).
+ * .cu compilation units). Windows permits one device only; multi-device
+ * requests are rejected rather than silently selecting a subset.
  */
 #include "ds4_gpu_args.h"
 
@@ -125,6 +126,13 @@ int parse_gpu_vram_arg(const char     *vram_arg,
             return 1;
         }
     }
+#ifdef _WIN32
+    if (dev_count > 1) {
+        errbuf_set(errbuf, errbuflen,
+                   "multi-GPU inference is not supported on Windows; select one device with --gpu-devices N");
+        return 1;
+    }
+#endif
 
     /* Case 1: vram_arg unset. */
     if (vram_arg == NULL) {
@@ -161,6 +169,14 @@ int parse_gpu_vram_arg(const char     *vram_arg,
                                           errbuf, errbuflen) != 0) {
             return 1;
         }
+#ifdef _WIN32
+        if (out->n_gpus > 1) {
+            out->n_gpus = 0;
+            errbuf_set(errbuf, errbuflen,
+                       "multi-GPU inference is not supported on Windows; select one device with --gpu-devices N");
+            return 1;
+        }
+#endif
         return 0;
 #else
         (void)dev_list; (void)dev_count;
@@ -186,6 +202,13 @@ int parse_gpu_vram_arg(const char     *vram_arg,
                     dev_count, vram_count);
         return 1;
     }
+#ifdef _WIN32
+    if (vram_count > 1) {
+        errbuf_set(errbuf, errbuflen,
+                   "multi-GPU inference is not supported on Windows; specify one --gpu-vram budget");
+        return 1;
+    }
+#endif
     out->n_gpus = vram_count;
     for (int i = 0; i < vram_count; i++) {
         int dev_id = (dev_count > 0) ? (int)dev_list[i] : i;

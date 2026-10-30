@@ -8,6 +8,7 @@
 #include <netdb.h>
 #include <poll.h>
 #include <signal.h>
+#include <spawn.h>
 #include <stdarg.h>
 #include <stdbool.h>
 #include <stdint.h>
@@ -21,6 +22,11 @@
 #include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
+#ifdef _WIN32
+#include <windows.h>
+#endif
+
+extern char **environ;
 
 #ifndef PATH_MAX
 #define PATH_MAX 4096
@@ -157,11 +163,28 @@ static bool web_mkdir_p(const char *path) {
     if (!path || !path[0]) return false;
     char tmp[PATH_MAX];
     snprintf(tmp, sizeof(tmp), "%s", path);
-    for (char *p = tmp + 1; *p; p++) {
+    char *start = tmp + 1;
+#ifdef _WIN32
+    if ((tmp[0] == '/' || tmp[0] == '\\') && (tmp[1] == '/' || tmp[1] == '\\')) {
+        start = tmp + 2;
+        for (int component = 0; component < 2 && *start; component++) {
+            while (*start && *start != '/' && *start != '\\') start++;
+            if (*start) start++;
+        }
+    }
+#endif
+    for (char *p = start; *p; p++) {
+#ifdef _WIN32
+        if (*p != '/' && *p != '\\') continue;
+        if ((p == tmp + 2 && tmp[1] == ':') ||
+            (p == tmp + 1 && (tmp[0] == '/' || tmp[0] == '\\'))) continue;
+#else
         if (*p != '/') continue;
+#endif
+        char separator = *p;
         *p = '\0';
         if (mkdir(tmp, 0700) != 0 && errno != EEXIST) return false;
-        *p = '/';
+        *p = separator;
     }
     return mkdir(tmp, 0700) == 0 || errno == EEXIST;
 }
@@ -963,6 +986,33 @@ static bool web_scroll_dynamic_page(cdp_ws *ws, char *err, size_t err_len) {
 static char *web_chrome_executable(void) {
     const char *env = getenv("DS4_CHROME");
     if (env && env[0]) return web_xstrdup(env);
+#ifdef _WIN32
+    const char *roots[] = {getenv("LOCALAPPDATA"), getenv("ProgramW6432"),
+                           getenv("ProgramFiles"), getenv("ProgramFiles(x86)")};
+    const char *suffixes[] = {"/Google/Chrome/Application/chrome.exe",
+                              "/Chromium/Application/chrome.exe",
+                              "/Microsoft/Edge/Application/msedge.exe"};
+    for (int i = 0; i < 4; i++) {
+        if (!roots[i] || !roots[i][0]) continue;
+        for (int j = 0; j < 3; j++) {
+            char candidate[PATH_MAX];
+            if (snprintf(candidate, sizeof(candidate), "%s%s", roots[i], suffixes[j]) <
+                (int)sizeof(candidate) && access(candidate, X_OK) == 0)
+                return web_xstrdup(candidate);
+        }
+    }
+    const char *names[] = {"chrome.exe", "chromium.exe", "msedge.exe"};
+    for (int i = 0; i < 3; i++) {
+        wchar_t name[32], found[PATH_MAX];
+        char candidate[PATH_MAX];
+        MultiByteToWideChar(CP_UTF8, 0, names[i], -1, name, 32);
+        DWORD n = SearchPathW(NULL, name, NULL, PATH_MAX, found, NULL);
+        if (n && n < PATH_MAX &&
+            WideCharToMultiByte(CP_UTF8, 0, found, -1, candidate, PATH_MAX, NULL, NULL))
+            return web_xstrdup(candidate);
+    }
+    return web_xstrdup("chrome.exe");
+#else
 #ifdef __APPLE__
     if (access("/Applications/Google Chrome.app/Contents/MacOS/Google Chrome", X_OK) == 0)
         return web_xstrdup("/Applications/Google Chrome.app/Contents/MacOS/Google Chrome");
@@ -1007,6 +1057,7 @@ static char *web_chrome_executable(void) {
         free(path);
     }
     return web_xstrdup("google-chrome");
+#endif
 }
 
 #ifdef __APPLE__
@@ -1019,6 +1070,16 @@ static const char *web_macos_chrome_app_name(void) {
     return NULL;
 }
 #endif
+
+static void web_cleanup_startup(ds4_web *web) {
+    if (web->chrome_pid <= 0) return;
+    kill(-web->chrome_pid, SIGKILL);
+    while (waitpid(web->chrome_pid, NULL, 0) < 0 && errno == EINTR) {}
+#ifdef _WIN32
+    ds4_win32_spawn_forget(web->chrome_pid);
+#endif
+    web->chrome_pid = 0;
+}
 
 static bool web_spawn_chrome(ds4_web *web, char *err, size_t err_len) {
     if (!web_mkdir_p(web->profile_dir)) {
@@ -1036,69 +1097,100 @@ static bool web_spawn_chrome(ds4_web *web, char *err, size_t err_len) {
     char port_arg[64], profile_arg[PATH_MAX + 64];
     snprintf(port_arg, sizeof(port_arg), "--remote-debugging-port=%d", web->port);
     snprintf(profile_arg, sizeof(profile_arg), "--user-data-dir=%s", web->profile_dir);
-    pid_t pid = fork();
-    if (pid < 0) {
-        web_set_err(err, err_len, "failed to fork Chrome: %s", strerror(errno));
+    char *argv[24];
+    int argc = 0;
+    const char *launch_exe = exe;
+#ifdef __APPLE__
+    if (launched_via_open) {
+        launch_exe = "/usr/bin/open";
+        argv[argc++] = "open";
+        argv[argc++] = "-g";
+        argv[argc++] = "-na";
+        argv[argc++] = (char *)mac_app_name;
+        argv[argc++] = "--args";
+    }
+#endif
+    if (!launched_via_open) argv[argc++] = exe;
+    argv[argc++] = port_arg;
+    argv[argc++] = "--remote-allow-origins=*";
+    argv[argc++] = profile_arg;
+    argv[argc++] = "--no-first-run";
+    argv[argc++] = "--no-default-browser-check";
+    argv[argc++] = "--disable-sync";
+#ifdef __APPLE__
+    argv[argc++] = "--use-mock-keychain";
+#elif !defined(_WIN32)
+    if (geteuid() == 0) argv[argc++] = "--no-sandbox";
+#endif
+    argv[argc++] = "--password-store=basic";
+    argv[argc++] = "--mute-audio";
+    argv[argc++] = "about:blank";
+    argv[argc] = NULL;
+    pid_t pid = 0;
+    posix_spawnattr_t attr;
+    posix_spawn_file_actions_t actions;
+    int rc = posix_spawnattr_init(&attr);
+    if (rc) {
+        web_set_err(err, err_len, "failed to initialize Chrome spawn: %s", strerror(rc));
         free(exe);
         return false;
     }
-    if (pid == 0) {
-        int nullfd = open("/dev/null", O_RDWR);
-        if (nullfd >= 0) {
-            dup2(nullfd, STDOUT_FILENO);
-            dup2(nullfd, STDERR_FILENO);
-            if (nullfd > 2) close(nullfd);
-        }
-#ifdef __APPLE__
-        if (launched_via_open) {
-            execlp("/usr/bin/open", "open", "-g", "-na", mac_app_name,
-                   "--args", port_arg, "--remote-allow-origins=*",
-                   profile_arg, "--no-first-run", "--no-default-browser-check",
-                   "--disable-sync", "--use-mock-keychain", "--password-store=basic",
-                   "--mute-audio", "about:blank", (char *)NULL);
-        } else {
-            execlp(exe, exe, port_arg, "--remote-allow-origins=*",
-                   profile_arg, "--no-first-run", "--no-default-browser-check",
-                   "--disable-sync", "--use-mock-keychain", "--password-store=basic",
-                   "--mute-audio", "about:blank", (char *)NULL);
-        }
-#else
-        if (geteuid() == 0) {
-            execlp(exe, exe, port_arg, "--remote-allow-origins=*",
-                   profile_arg, "--no-first-run", "--no-default-browser-check",
-                   "--disable-sync", "--password-store=basic", "--no-sandbox",
-                   "--mute-audio", "about:blank", (char *)NULL);
-        } else {
-            execlp(exe, exe, port_arg, "--remote-allow-origins=*",
-                   profile_arg, "--no-first-run", "--no-default-browser-check",
-                   "--disable-sync", "--password-store=basic",
-                   "--mute-audio", "about:blank", (char *)NULL);
-        }
-#endif
-        _exit(127);
+    rc = posix_spawn_file_actions_init(&actions);
+    if (rc) {
+        posix_spawnattr_destroy(&attr);
+        web_set_err(err, err_len, "failed to initialize Chrome descriptors: %s", strerror(rc));
+        free(exe);
+        return false;
+    }
+    rc = posix_spawnattr_setpgroup(&attr, 0);
+    if (!rc) rc = posix_spawnattr_setflags(&attr, POSIX_SPAWN_SETPGROUP);
+    for (int fd = 0; !rc && fd < 3; fd++)
+        rc = posix_spawn_file_actions_addopen(&actions, fd, "/dev/null", O_RDWR, 0);
+    if (!rc) rc = posix_spawnp(&pid, launch_exe, &actions, &attr, argv, environ);
+    posix_spawn_file_actions_destroy(&actions);
+    posix_spawnattr_destroy(&attr);
+    if (rc) {
+        web_set_err(err, err_len, "failed to spawn browser %s: %s (set DS4_CHROME to its executable path)",
+                    exe, strerror(rc));
+        free(exe);
+        return false;
     }
     free(exe);
     web->chrome_pid = pid;
     for (int i = 0; i < 80; i++) {
-        if (web_set_cancel_err(web, err, err_len)) return false;
+        if (web_set_cancel_err(web, err, err_len)) {
+            web_cleanup_startup(web);
+            return false;
+        }
         if (web_cdp_alive(web)) {
+#ifdef _WIN32
+            int detach_rc = ds4_win32_spawn_detach(pid);
+            if (detach_rc) {
+                web_set_err(err, err_len, "failed to detach browser: %s", strerror(errno));
+                web_cleanup_startup(web);
+                return false;
+            }
+            web->chrome_pid = 0;
+#endif
             web_log(web, "Chrome browser session is ready");
             return true;
         }
         int status = 0;
-        pid_t rc = waitpid(pid, &status, WNOHANG);
-        if (rc == pid) {
-            web->chrome_pid = 0;
-            if (launched_via_open) continue;
-            web_set_err(err, err_len, "Chrome exited before CDP became ready");
+        pid_t waited = waitpid(pid, &status, WNOHANG);
+        if (waited == pid) {
+            if (launched_via_open) { web->chrome_pid = 0; continue; }
+            web_cleanup_startup(web);
+            web_set_err(err, err_len, "Chrome exited before CDP became ready (status %d)", status);
             return false;
         }
         if (!web_sleep_ms(web, 250)) {
             web_set_err(err, err_len, "interrupted");
+            web_cleanup_startup(web);
             return false;
         }
     }
     web_set_err(err, err_len, "Chrome did not expose CDP on port %d", web->port);
+    web_cleanup_startup(web);
     return false;
 }
 
@@ -1395,6 +1487,9 @@ ds4_web *ds4_web_create(const ds4_web_config *cfg) {
     memset(web, 0, sizeof(*web));
     const char *home = cfg && cfg->home_dir && cfg->home_dir[0] ?
         cfg->home_dir : getenv("HOME");
+#ifdef _WIN32
+    if (!home || !home[0]) home = getenv("USERPROFILE");
+#endif
     if (!home || !home[0]) home = ".";
     snprintf(web->home, sizeof(web->home), "%s", home);
     snprintf(web->profile_dir, sizeof(web->profile_dir), "%s/.ds4/browser", home);

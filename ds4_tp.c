@@ -11,7 +11,9 @@
 #include <limits.h>
 #include <netdb.h>
 #include <stdarg.h>
+#ifndef _WIN32
 #include <sys/uio.h>
+#endif
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 #include <pthread.h>
@@ -365,6 +367,7 @@ static int tp_socket_set_gate_timeout(int fd, uint64_t timeout_ms) {
     return 1;
 }
 
+#ifndef _WIN32
 static void tp_iov_advance(struct msghdr *msg, size_t bytes) {
     while (msg->msg_iovlen && bytes >= msg->msg_iov->iov_len) {
         bytes -= msg->msg_iov->iov_len;
@@ -417,10 +420,22 @@ static int tp_tcp_exchange_io(ds4_tp *tp, ds4_tp_gate_header *header,
     }
     return 1;
 }
+#endif
 
 static int tp_tcp_exchange(ds4_tp *tp, ds4_tp_gate_header *header,
                            ds4_tp_gate_header *peer_header,
                            const void *out, void *in, size_t bytes) {
+#ifdef _WIN32
+    /* No Windows TP transport exists; creation rejects before any socket I/O. */
+    (void)tp;
+    (void)header;
+    (void)peer_header;
+    (void)out;
+    (void)in;
+    (void)bytes;
+    errno = ENOTSUP;
+    return 0;
+#else
 #ifdef __APPLE__
     /* Darwin sendmsg can block despite MSG_DONTWAIT. The data socket has
      * one exchange owner; restore its mode before blocking header I/O. */
@@ -436,6 +451,7 @@ static int tp_tcp_exchange(ds4_tp *tp, ds4_tp_gate_header *header,
     errno = saved_errno;
 #endif
     return ok;
+#endif
 }
 
 #ifdef DS4_TP_HAVE_VERBS
@@ -638,6 +654,11 @@ int ds4_tp_adopt_distributed_options(
         size_t errlen)
 {
     if (!tp || !dist || !tp->requested) return 1;
+#ifdef _WIN32
+    tp_set_err(err, errlen,
+               "tensor parallelism and RDMA are not supported on Windows; use a single-device engine");
+    return 0;
+#endif
     if (tp->role != DS4_TP_NONE) {
         tp_set_err(err, errlen,
                    "--tensor-parallel selects its role through --role");
@@ -702,6 +723,16 @@ int ds4_tp_validate_engine_options(
         char *err,
         size_t errlen)
 {
+#ifdef _WIN32
+    if (ds4_tp_enabled(&opt->tp) || opt->tp.requested ||
+        opt->tp.transport != DS4_TP_TRANSPORT_AUTO || opt->tp.rdma_device ||
+        opt->tp.rdma_gid_index_set || opt->tp.glm_token_prefill ||
+        opt->tp.debug_hash != 0 || opt->cuda_tensor_parallel) {
+        tp_set_err(err, errlen,
+                   "tensor parallelism and RDMA are not supported on Windows; use a single-device engine");
+        return 0;
+    }
+#endif
     if (!ds4_tp_enabled(&opt->tp)) {
         if (opt->tp.requested || opt->tp.transport != DS4_TP_TRANSPORT_AUTO ||
             opt->tp.rdma_device || opt->tp.rdma_gid_index_set ||
@@ -2426,6 +2457,14 @@ int ds4_tp_create(
         char *err,
         size_t errlen)
 {
+#ifdef _WIN32
+    (void)opt;
+    (void)id;
+    if (out) *out = NULL;
+    tp_set_err(err, errlen,
+               "tensor parallelism and RDMA are not supported on Windows; use a single-device engine");
+    return 0;
+#endif
     *out = NULL;
     ds4_tp *tp = calloc(1, sizeof(*tp));
     if (!tp) {
@@ -3711,6 +3750,12 @@ static int tp_worker_send_logits(ds4_tp *tp, ds4_session *session,
 }
 
 int ds4_tp_worker_run(ds4_engine *engine, const ds4_tp_options *opt) {
+#ifdef _WIN32
+    (void)engine;
+    (void)opt;
+    fprintf(stderr, "ds4: tensor parallelism and RDMA are not supported on Windows; use a single-device engine\n");
+    return 1;
+#endif
     char err[256] = "";
     ds4_tp_identity id = {
         .gguf_bytes = ds4_engine_model_bytes(engine),

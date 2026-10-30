@@ -54,7 +54,7 @@ ds4_dist_cli_parse_result ds4_dist_parse_cli_arg(
         size_t errlen);
 
 /* Applies distributed layer-loading choices to the engine options before the
- * model is loaded.
+ * model is loaded. Windows rejects distributed roles without changing engine.
  */
 int ds4_dist_prepare_engine_options(
         const ds4_dist_options *opt,

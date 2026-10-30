@@ -8,6 +8,9 @@
 #include <string.h>
 #include <time.h>
 #include <unistd.h>
+#ifdef _WIN32
+#include "compat/win32/platform.h"
+#endif
 
 #define CHECK(x) do { if (!(x)) { fprintf(stderr, "%s:%d: %s\n", __FILE__, __LINE__, #x); exit(1); } } while (0)
 static uint32_t state = 1743;
@@ -106,7 +109,12 @@ static void check_slices(void) {
     }
     for (unsigned r = 0; r < ROWS; r++) for (unsigned k = 0; k < WIDTH; k++)
         input[r * WIDTH + k] = (k % 32 == 0 ? 127 : (int)(random_bits() % 255) - 127);
+#ifdef _WIN32
+    char path[32768];
+    CHECK(ds4_win32_temp_path(path, sizeof(path), "ds4-q8-slice-XXXXXX") == 0);
+#else
     char path[] = "/tmp/ds4-q8-slice-XXXXXX";
+#endif
     const int fd = mkstemp(path);
     CHECK(fd >= 0);
     FILE *file = fdopen(dup(fd), "wb");
@@ -169,7 +177,12 @@ static void check_slice_rows(unsigned width, unsigned outputs, int timing) {
     }
     for (size_t i = 0; i < (size_t)rows * count; i++)
         input[i] = ((int)(random_bits() >> 16) - 32768) / 8192.0f;
+#ifdef _WIN32
+    char path[32768];
+    CHECK(ds4_win32_temp_path(path, sizeof(path), "ds4-q8-slice-rows-XXXXXX") == 0);
+#else
     char path[] = "/tmp/ds4-q8-slice-rows-XXXXXX";
+#endif
     const int fd = mkstemp(path);
     CHECK(fd >= 0);
     FILE *file = fdopen(dup(fd), "wb");

@@ -28,11 +28,17 @@
 #include <stdlib.h>
 #include <string.h>
 #include <strings.h>
+#ifndef _WIN32
 #include <sys/ioctl.h>
+#endif
 #include <sys/stat.h>
 #include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
+#ifdef _WIN32
+#include <windows.h>
+#include <wchar.h>
+#endif
 #ifdef __APPLE__
 #include <copyfile.h>
 #elif defined(__linux__)
@@ -150,6 +156,7 @@ typedef struct {
     bool user_activity;
     bool session_dirty;
     pthread_t thread;
+    bool thread_started;
     pthread_mutex_t mu;
     pthread_cond_t cond;
     int wake_fd[2];
@@ -2922,10 +2929,18 @@ static const agent_syntax *agent_syntax_for_lang(const char *lang) {
     return &agent_syntaxes[0];
 }
 
+static const char *agent_path_basename(const char *path) {
+    const char *base = strrchr(path, '/');
+#ifdef _WIN32
+    const char *backslash = strrchr(path, '\\');
+    if (backslash && (!base || backslash > base)) base = backslash;
+#endif
+    return base ? base + 1 : path;
+}
+
 static const agent_syntax *agent_syntax_for_path(const char *path) {
     if (!path || !path[0]) return agent_syntax_for_lang(NULL);
-    const char *base = strrchr(path, '/');
-    base = base ? base + 1 : path;
+    const char *base = agent_path_basename(path);
     if (!strcasecmp(base, "Dockerfile")) return agent_syntax_for_lang("sh");
     if (!strcasecmp(base, "Makefile") || !strcasecmp(base, "makefile"))
         return agent_syntax_for_lang("sh");
@@ -3190,9 +3205,15 @@ static void renderer_code_line_append(agent_token_renderer *r,
 }
 
 static int renderer_terminal_cols(void) {
+#ifdef _WIN32
+    CONSOLE_SCREEN_BUFFER_INFO info;
+    if (GetConsoleScreenBufferInfo(GetStdHandle(STD_OUTPUT_HANDLE), &info))
+        return info.srWindow.Right - info.srWindow.Left + 1;
+#else
     struct winsize ws;
     if (ioctl(STDOUT_FILENO, TIOCGWINSZ, &ws) == 0 && ws.ws_col > 0)
         return ws.ws_col;
+#endif
     return 80;
 }
 
@@ -4679,17 +4700,70 @@ static bool agent_tokens_equal(const ds4_tokens *a, const ds4_tokens *b) {
     return true;
 }
 
+static const char *agent_home_dir(void) {
+    const char *home = getenv("HOME");
+#ifdef _WIN32
+    if (!home || !home[0]) home = getenv("USERPROFILE");
+#endif
+    return home && home[0] ? home : ".";
+}
+
+static bool agent_path_separator(char c) {
+#ifdef _WIN32
+    return c == '/' || c == '\\';
+#else
+    return c == '/';
+#endif
+}
+
+/* Keep generated paths native: Windows has no process-global /tmp directory. */
+static int agent_temp_template(char *path, size_t size, const char *prefix) {
+#ifdef _WIN32
+    wchar_t wide[PATH_MAX];
+    char dir[PATH_MAX];
+    DWORD n = GetTempPathW(PATH_MAX, wide);
+    if (!n || n >= PATH_MAX ||
+        !WideCharToMultiByte(CP_UTF8, 0, wide, -1, dir, sizeof(dir), NULL, NULL)) {
+        errno = ENAMETOOLONG;
+        return -1;
+    }
+#else
+    const char *dir = "/tmp/";
+#endif
+    int nbytes = snprintf(path, size, "%s%s_XXXXXX", dir, prefix);
+    if (nbytes < 0 || (size_t)nbytes >= size) {
+        errno = ENAMETOOLONG;
+        return -1;
+    }
+    return 0;
+}
+
 static bool agent_mkdir_p(const char *path) {
     if (!path || !path[0]) return false;
     char *tmp = xstrdup(path);
-    for (char *p = tmp + 1; *p; p++) {
-        if (*p != '/') continue;
+    char *start = tmp + 1;
+#ifdef _WIN32
+    if (agent_path_separator(tmp[0]) && agent_path_separator(tmp[1])) {
+        start = tmp + 2;
+        for (int component = 0; component < 2 && *start; component++) {
+            while (*start && !agent_path_separator(*start)) start++;
+            if (*start) start++;
+        }
+    }
+#endif
+    for (char *p = start; *p; p++) {
+        if (!agent_path_separator(*p)) continue;
+#ifdef _WIN32
+        if (p == tmp + 2 && tmp[1] == ':') continue;
+        if (p == tmp + 1 && agent_path_separator(tmp[0])) continue;
+#endif
+        char separator = *p;
         *p = '\0';
         if (mkdir(tmp, 0700) != 0 && errno != EEXIST) {
             free(tmp);
             return false;
         }
-        *p = '/';
+        *p = separator;
     }
     bool ok = mkdir(tmp, 0700) == 0 || errno == EEXIST;
     free(tmp);
@@ -4697,8 +4771,7 @@ static bool agent_mkdir_p(const char *path) {
 }
 
 static char *agent_default_cache_dir(void) {
-    const char *home = getenv("HOME");
-    if (!home || !home[0]) home = ".";
+    const char *home = agent_home_dir();
     agent_buf b = {0};
     agent_buf_puts(&b, home);
     if (b.len == 0 || b.ptr[b.len - 1] != '/') agent_buf_puts(&b, "/");
@@ -5103,7 +5176,11 @@ static bool agent_kv_save_path(agent_worker *w, const char *path,
         if (!saved_errno) saved_errno = errno;
         ok = false;
     }
+#ifdef _WIN32
+    if (ok && renameat(AT_FDCWD, tmp, AT_FDCWD, path) != 0) {
+#else
     if (ok && rename(tmp, path) != 0) {
+#endif
         saved_errno = errno;
         ok = false;
     }
@@ -6511,7 +6588,11 @@ static bool agent_worker_strip_session(agent_worker *w, const char *prefix,
         if (!saved_errno) saved_errno = errno;
         ok = false;
     }
+#ifdef _WIN32
+    if (ok && renameat(AT_FDCWD, tmp, AT_FDCWD, path) != 0) {
+#else
     if (ok && rename(tmp, path) != 0) {
+#endif
         saved_errno = errno;
         ok = false;
     }
@@ -7050,6 +7131,7 @@ static char *agent_tool_list(const agent_tool_call *call) {
  * ============================================================================
  */
 
+#ifndef _WIN32
 static bool agent_same_file_version(const struct stat *a, const struct stat *b) {
 #ifdef __APPLE__
     struct timespec am = a->st_mtimespec, bm = b->st_mtimespec;
@@ -7063,6 +7145,7 @@ static bool agent_same_file_version(const struct stat *a, const struct stat *b) 
            am.tv_sec == bm.tv_sec && am.tv_nsec == bm.tv_nsec &&
            ac.tv_sec == bc.tv_sec && ac.tv_nsec == bc.tv_nsec;
 }
+#endif
 
 #ifdef __linux__
 /* Linux stores ACLs as xattrs too. A metadata copy failure must abort the
@@ -7099,12 +7182,124 @@ done:
 }
 #endif
 
+#ifdef _WIN32
+static bool agent_windows_same_file(const BY_HANDLE_FILE_INFORMATION *a,
+                                    const BY_HANDLE_FILE_INFORMATION *b) {
+    return a->dwVolumeSerialNumber == b->dwVolumeSerialNumber &&
+        a->nFileIndexHigh == b->nFileIndexHigh && a->nFileIndexLow == b->nFileIndexLow &&
+        a->nFileSizeHigh == b->nFileSizeHigh && a->nFileSizeLow == b->nFileSizeLow &&
+        a->nNumberOfLinks == b->nNumberOfLinks &&
+        CompareFileTime(&a->ftLastWriteTime, &b->ftLastWriteTime) == 0;
+}
+
+/* ReplaceFile preserves the destination ACL/attributes and alternate streams;
+ * chmod/chown cannot express those semantics on Windows. Resolve existing
+ * symlinks through their open handle and reject hard links as on Unix. */
+static int agent_windows_replace_file(const char *path, const char *data, size_t len,
+                                      const char *expected, size_t expected_len,
+                                      char *err, size_t errlen) {
+    wchar_t input[PATH_MAX], target[PATH_MAX], temp[PATH_MAX] = L"";
+    HANDLE src = INVALID_HANDLE_VALUE, dst = INVALID_HANDLE_VALUE, check = INVALID_HANDLE_VALUE;
+    BY_HANDLE_FILE_INFORMATION before, after;
+    FILE_BASIC_INFO basic_before, basic_after;
+    DWORD error = ERROR_SUCCESS;
+    bool exists = false;
+    int rc = -1;
+    if (!MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, path, -1, input, PATH_MAX)) {
+        error = GetLastError(); goto failed;
+    }
+    src = CreateFileW(input, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                       NULL, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, NULL);
+    if (src != INVALID_HANDLE_VALUE) {
+        exists = true;
+        if (!GetFileInformationByHandle(src, &before) ||
+            !GetFileInformationByHandleEx(src, FileBasicInfo, &basic_before, sizeof(basic_before))) {
+            error = GetLastError(); goto failed;
+        }
+        if ((before.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) || before.nNumberOfLinks != 1) {
+            snprintf(err, errlen, "refusing to replace non-regular or hard-linked file: %s", path);
+            goto done;
+        }
+        DWORD n = GetFinalPathNameByHandleW(src, target, PATH_MAX, FILE_NAME_NORMALIZED);
+        if (!n || n >= PATH_MAX) { error = ERROR_FILENAME_EXCED_RANGE; goto failed; }
+        if (expected) {
+            uint64_t size = ((uint64_t)before.nFileSizeHigh << 32) | before.nFileSizeLow;
+            if (size != expected_len) goto changed;
+            char buf[8192];
+            for (size_t pos = 0; pos < expected_len;) {
+                DWORD nread = 0, want = (DWORD)((expected_len - pos > sizeof(buf)) ?
+                                                sizeof(buf) : expected_len - pos);
+                if (!ReadFile(src, buf, want, &nread, NULL)) { error = GetLastError(); goto failed; }
+                if (!nread || memcmp(buf, expected + pos, nread)) goto changed;
+                pos += nread;
+            }
+        }
+    } else {
+        error = GetLastError();
+        if (error != ERROR_FILE_NOT_FOUND && error != ERROR_PATH_NOT_FOUND) goto failed;
+        if (expected) goto changed;
+        DWORD n = GetFullPathNameW(input, PATH_MAX, target, NULL);
+        if (!n || n >= PATH_MAX) { error = ERROR_FILENAME_EXCED_RANGE; goto failed; }
+    }
+    static LONG sequence;
+    for (int attempt = 0; attempt < 100; attempt++) {
+        int n = swprintf(temp, PATH_MAX, L"%ls.ds4-%lu-%lu-%lu.tmp", target,
+                         GetCurrentProcessId(), GetTickCount(), (unsigned long)InterlockedIncrement(&sequence));
+        if (n < 0 || n >= PATH_MAX) { temp[0] = 0; error = ERROR_FILENAME_EXCED_RANGE; goto failed; }
+        dst = CreateFileW(temp, GENERIC_WRITE, 0, NULL, CREATE_NEW, FILE_ATTRIBUTE_NORMAL, NULL);
+        if (dst != INVALID_HANDLE_VALUE) break;
+        error = GetLastError();
+        temp[0] = 0; /* Never delete a colliding file owned by someone else. */
+        if (error != ERROR_FILE_EXISTS && error != ERROR_ALREADY_EXISTS) goto failed;
+    }
+    if (dst == INVALID_HANDLE_VALUE) goto failed;
+    for (size_t pos = 0; pos < len;) {
+        DWORD written = 0, want = (DWORD)((len - pos > MAXDWORD) ? MAXDWORD : len - pos);
+        if (!WriteFile(dst, data + pos, want, &written, NULL) || !written) {
+            error = GetLastError(); if (!error) error = ERROR_WRITE_FAULT; goto failed;
+        }
+        pos += written;
+    }
+    if (!FlushFileBuffers(dst)) { error = GetLastError(); goto failed; }
+    CloseHandle(dst); dst = INVALID_HANDLE_VALUE;
+    if (exists) {
+        check = CreateFileW(input, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                             NULL, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, NULL);
+        if (check == INVALID_HANDLE_VALUE || !GetFileInformationByHandle(check, &after) ||
+            !agent_windows_same_file(&before, &after) ||
+            !GetFileInformationByHandleEx(check, FileBasicInfo, &basic_after, sizeof(basic_after)) ||
+            basic_before.ChangeTime.QuadPart != basic_after.ChangeTime.QuadPart) goto changed;
+        if (!ReplaceFileW(target, temp, NULL, 0, NULL, NULL)) { error = GetLastError(); goto failed; }
+    } else {
+        /* No REPLACE_EXISTING: a concurrent creator must win rather than lose data. */
+        if (!MoveFileExW(temp, target, MOVEFILE_WRITE_THROUGH)) { error = GetLastError(); goto failed; }
+    }
+    temp[0] = 0;
+    rc = 0;
+    goto done;
+changed:
+    snprintf(err, errlen, "file changed while editing; read it again: %s", path);
+    goto done;
+failed:
+    snprintf(err, errlen, "replace %s: Windows error %lu", path, (unsigned long)error);
+done:
+    if (check != INVALID_HANDLE_VALUE) CloseHandle(check);
+    if (src != INVALID_HANDLE_VALUE) CloseHandle(src);
+    if (dst != INVALID_HANDLE_VALUE) CloseHandle(dst);
+    if (temp[0]) DeleteFileW(temp);
+    return rc;
+}
+#endif
+
 /* Commit only complete files. Follow existing symlinks, but refuse hard links:
  * an atomic rename cannot preserve their shared-inode semantics. The version
  * checks catch concurrent edits, though unrelated writers do not take a lock. */
 static int agent_replace_file(const char *path, const char *data, size_t len,
                               const char *expected, size_t expected_len,
                               char *err, size_t errlen) {
+#ifdef _WIN32
+    return agent_windows_replace_file(path, data, len, expected, expected_len, err, errlen);
+#else
     char target[PATH_MAX], temp[PATH_MAX] = "";
     struct stat before, after;
     int src = -1, fd = -1, rc = -1;
@@ -7196,6 +7391,7 @@ done:
     if (src >= 0) close(src);
     if (temp[0]) unlink(temp);
     return rc;
+#endif
 }
 
 static void agent_edit_result_append_line(agent_buf *b, const char *data,
@@ -8387,8 +8583,7 @@ static int agent_search_read_line(FILE *fp, char **text) {
 static void agent_search_file(agent_search_ctx *ctx, const char *path) {
     if (ctx->results >= ctx->max_results || ctx->out.truncated) return;
     if (ctx->glob && ctx->glob[0]) {
-        const char *base = strrchr(path, '/');
-        base = base ? base + 1 : path;
+        const char *base = agent_path_basename(path);
         if (fnmatch(ctx->glob, base, 0) != 0 && fnmatch(ctx->glob, path, 0) != 0)
             return;
     }
@@ -8592,8 +8787,7 @@ static bool agent_write_temp_text(const char *prefix, const char *text,
                                   char *path, size_t path_len,
                                   char *err, size_t err_len) {
     char tmpl[PATH_MAX];
-    snprintf(tmpl, sizeof(tmpl), "/tmp/%s_XXXXXX", prefix);
-    int fd = mkstemp(tmpl);
+    int fd = agent_temp_template(tmpl, sizeof(tmpl), prefix) == 0 ? mkstemp(tmpl) : -1;
     if (fd < 0) {
         snprintf(err, err_len, "failed to create temporary file: %s", strerror(errno));
         return false;
@@ -8701,7 +8895,7 @@ static char *agent_tool_visit_page(agent_worker *w, const agent_tool_call *call)
  * ============================================================================
  *
  * Bash commands are tracked jobs, not blocking one-shot calls.  Each job owns a
- * process, a pipe, and a secure /tmp output file.  The first observation is
+ * process, a pipe, and a secure temporary output file. The first observation is
  * head-biased so headers and early errors are visible; later progress updates
  * are tail-biased and report the total captured output size.
  */
@@ -8777,6 +8971,9 @@ static void agent_bash_job_free(agent_bash_job *job) {
         while (waitpid(job->pid, NULL, 0) < 0 && errno == EINTR) {}
     if (job->pipe_fd >= 0) close(job->pipe_fd);
     if (job->tmp_fd >= 0) close(job->tmp_fd);
+#ifdef _WIN32
+    if (job->pid > 0) ds4_win32_spawn_forget(job->pid);
+#endif
     pthread_mutex_destroy(&job->mu);
     free(job);
 }
@@ -8937,6 +9134,34 @@ static void *agent_bash_monitor(void *arg) {
     return NULL;
 }
 
+#ifdef _WIN32
+/* WSL's system32/bash.exe is not a native POSIX shell for inherited Win32
+ * pipes or working directories. Prefer Git Bash; never reinterpret tools as
+ * cmd.exe syntax. DS4_SHELL is an executable path, not a command line. */
+static bool agent_windows_shell(char path[PATH_MAX]) {
+    const char *explicit_shell = getenv("DS4_SHELL");
+    if (explicit_shell && explicit_shell[0]) {
+        if (snprintf(path, PATH_MAX, "%s", explicit_shell) >= PATH_MAX) return false;
+        return access(path, X_OK) == 0;
+    }
+    const char *roots[] = {getenv("ProgramW6432"), getenv("ProgramFiles"),
+                           getenv("LOCALAPPDATA"), NULL};
+    for (int i = 0; i < 3; i++) {
+        if (!roots[i] || !roots[i][0]) continue;
+        const char *suffix = i == 2 ? "/Programs/Git/bin/bash.exe" : "/Git/bin/bash.exe";
+        if (snprintf(path, PATH_MAX, "%s%s", roots[i], suffix) < PATH_MAX &&
+            access(path, X_OK) == 0) return true;
+    }
+    wchar_t found[PATH_MAX], windows[PATH_MAX];
+    DWORD n = SearchPathW(NULL, L"bash.exe", NULL, PATH_MAX, found, NULL);
+    DWORD wn = GetWindowsDirectoryW(windows, PATH_MAX);
+    if (!n || n >= PATH_MAX || !wn || wn >= PATH_MAX) return false;
+    if (!_wcsnicmp(found, windows, wn) && (found[wn] == L'\\' || found[wn] == L'/'))
+        return false;
+    return WideCharToMultiByte(CP_UTF8, 0, found, -1, path, PATH_MAX, NULL, NULL) != 0;
+}
+#endif
+
 /* Do not fork the inference process: copying its wired, private model mappings
  * can exhaust memory before the child gets to exec, even with copy-on-write. */
 static int agent_bash_spawn(pid_t *pid, int tmpfd, const int pipefd[2],
@@ -8960,8 +9185,21 @@ static int agent_bash_spawn(pid_t *pid, int tmpfd, const int pipefd[2],
     /* A tool must not inherit or change the live terminal's input mode. */
     if (!rc) rc = posix_spawn_file_actions_addopen(&actions, STDIN_FILENO,
                                                  "/dev/null", O_RDONLY, 0);
+#ifdef _WIN32
+    char shell[PATH_MAX];
+    if (!rc && !agent_windows_shell(shell)) rc = ENOENT;
+    agent_buf script = {0};
+    /* Directly launched Git Bash does not run /etc/profile. Supply its POSIX
+     * utilities without sourcing user startup scripts or changing cwd. */
+    agent_buf_puts(&script, "export PATH=\"/usr/bin:/bin:$PATH\"\n");
+    agent_buf_puts(&script, cmd ? cmd : "");
+    char *argv[] = {shell, "--noprofile", "--norc", "-c", script.ptr, NULL};
+    if (!rc) rc = posix_spawn(pid, shell, &actions, &attr, argv, environ);
+    free(script.ptr);
+#else
     char *argv[] = {"sh", "-c", (char *)(cmd ? cmd : ""), NULL};
     if (!rc) rc = posix_spawn(pid, "/bin/sh", &actions, &attr, argv, environ);
+#endif
     posix_spawn_file_actions_destroy(&actions);
     posix_spawnattr_destroy(&attr);
     return rc;
@@ -8971,8 +9209,9 @@ static int agent_bash_spawn(pid_t *pid, int tmpfd, const int pipefd[2],
  * kill grandchildren created by the shell, not just the /bin/sh wrapper. */
 static agent_bash_job *agent_bash_start(agent_worker *w, const char *cmd,
                                         int timeout_sec, char *err, size_t err_len) {
-    char tmp_path[] = "/tmp/ds4_agent_output_XXXXXX";
-    int tmpfd = mkstemp(tmp_path);
+    char tmp_path[PATH_MAX];
+    int tmpfd = agent_temp_template(tmp_path, sizeof(tmp_path), "ds4_agent_output") == 0 ?
+        mkstemp(tmp_path) : -1;
     if (tmpfd < 0) {
         snprintf(err, err_len, "failed to create temporary output file: %s", strerror(errno));
         return NULL;
@@ -8996,10 +9235,16 @@ static agent_bash_job *agent_bash_start(agent_worker *w, const char *cmd,
     if (!rc && (fcntl(tmpfd, F_SETFD, FD_CLOEXEC) < 0 ||
                 fcntl(pipefd[0], F_SETFD, FD_CLOEXEC) < 0 ||
                 fcntl(pipefd[1], F_SETFD, FD_CLOEXEC) < 0)) rc = errno;
+    int old_flags;
+    if (!rc && set_nonblock(pipefd[0], true, &old_flags) != 0) rc = errno;
     pid_t pid;
     if (!rc) rc = agent_bash_spawn(&pid, tmpfd, pipefd, cmd);
     if (rc) {
+#ifdef _WIN32
+        snprintf(err, err_len, "failed to spawn POSIX shell: %s. Install Git for Windows or set DS4_SHELL to its bash.exe executable path", strerror(rc));
+#else
         snprintf(err, err_len, "failed to spawn shell: %s", strerror(rc));
+#endif
         close(pipefd[0]);
         close(pipefd[1]);
         close(tmpfd);
@@ -9007,8 +9252,6 @@ static agent_bash_job *agent_bash_start(agent_worker *w, const char *cmd,
         return NULL;
     }
     close(pipefd[1]);
-    int old_flags;
-    set_nonblock(pipefd[0], true, &old_flags);
 
     agent_bash_job *job = xmalloc(sizeof(*job));
     memset(job, 0, sizeof(*job));
@@ -11220,6 +11463,14 @@ static int set_nonblock(int fd, bool on, int *old_flags) {
     return fcntl(fd, F_SETFL, next);
 }
 
+static ssize_t agent_stdin_read(char *buf, size_t size) {
+#ifdef _WIN32
+    return linenoiseWindowsReadInput(STDIN_FILENO, buf, size, 1);
+#else
+    return read(STDIN_FILENO, buf, size);
+#endif
+}
+
 /* Check and clear the raw_mode_needs_restore flag under the worker mutex.
  * Returns true if the UI thread should verify/reapply linenoise raw mode. */
 static bool worker_check_raw_mode_restore(agent_worker *w) {
@@ -11820,7 +12071,7 @@ static void editor_queue_bytes(agent_editor *ed, const char *buf, size_t len) {
 static void editor_read_stdin(agent_editor *ed) {
     char buf[256];
     for (;;) {
-        ssize_t n = read(STDIN_FILENO, buf, sizeof(buf));
+        ssize_t n = agent_stdin_read(buf, sizeof(buf));
         if (n > 0) {
             editor_queue_bytes(ed, buf, (size_t)n);
             continue;
@@ -11975,6 +12226,13 @@ static bool find_cpr_reply(const char *buf, size_t len, size_t *start, size_t *e
  * bytes read while waiting for the CPR reply are queued back into linenoise so
  * typing during generation is not lost. */
 static bool editor_query_cursor(agent_editor *ed, int *col_out) {
+#ifdef _WIN32
+    (void)ed;
+    CONSOLE_SCREEN_BUFFER_INFO info;
+    if (!GetConsoleScreenBufferInfo(GetStdHandle(STD_OUTPUT_HANDLE), &info)) return false;
+    *col_out = info.dwCursorPosition.X - info.srWindow.Left + 1;
+    return *col_out > 0;
+#else
     if (!isatty(STDIN_FILENO) || !isatty(STDOUT_FILENO)) return false;
 
     char buf[512];
@@ -12008,6 +12266,7 @@ static bool editor_query_cursor(agent_editor *ed, int *col_out) {
 
     if (len) editor_queue_bytes(ed, buf, len);
     return false;
+#endif
 }
 
 static void editor_move_to_output_cursor(agent_editor *ed) {
@@ -12018,12 +12277,20 @@ static void editor_move_to_output_cursor(agent_editor *ed) {
 }
 
 static bool editor_get_terminal_size(int *rows, int *cols) {
+#ifdef _WIN32
+    CONSOLE_SCREEN_BUFFER_INFO info;
+    if (!GetConsoleScreenBufferInfo(GetStdHandle(STD_OUTPUT_HANDLE), &info)) return false;
+    *rows = info.srWindow.Bottom - info.srWindow.Top + 1;
+    *cols = info.srWindow.Right - info.srWindow.Left + 1;
+    return *rows > 0 && *cols > 0;
+#else
     struct winsize ws;
     if (ioctl(STDOUT_FILENO, TIOCGWINSZ, &ws) != 0) return false;
     if (ws.ws_row < 1 || ws.ws_col < 1) return false;
     *rows = ws.ws_row;
     *cols = ws.ws_col;
     return true;
+#endif
 }
 
 static void editor_csi_cursor(int row, int col) {
@@ -12261,8 +12528,12 @@ static int editor_start(agent_editor *ed, const char *prompt,
     ed->input = input;
     ed->edit.buflen_max = AGENT_INPUT_MAX_BUFLEN;
     ed->active = true;
+#ifdef _WIN32
+    ed->old_stdin_flags = -1; /* The console reader handles nonblocking input. */
+#else
     if (set_nonblock(STDIN_FILENO, true, &ed->old_stdin_flags) != 0)
         ed->old_stdin_flags = -1;
+#endif
     if (initial && initial[0]) linenoiseEditInsert(&ed->edit, initial, strlen(initial));
     ed->hidden = false;
     ed->output_line_open = false;
@@ -12675,8 +12946,21 @@ static int agent_worker_init(agent_worker *w, ds4_engine *engine, agent_config *
     w->status.state = AGENT_WORKER_IDLE;
     if (pipe(w->wake_fd) != 0) return -1;
     int old_flags;
-    set_nonblock(w->wake_fd[0], true, &old_flags);
-    set_nonblock(w->wake_fd[1], true, &old_flags);
+    int wake_error = set_nonblock(w->wake_fd[0], true, &old_flags) != 0 ||
+        fcntl(w->wake_fd[0], F_SETFD, FD_CLOEXEC) < 0 ||
+        fcntl(w->wake_fd[1], F_SETFD, FD_CLOEXEC) < 0;
+#ifndef _WIN32
+    if (!wake_error) wake_error = set_nonblock(w->wake_fd[1], true, &old_flags) != 0;
+#endif
+    /* Writes are coalesced under w->mu, so the blocking Windows writer holds
+     * at most one pending notification and cannot fill the pipe. */
+    if (wake_error) {
+        int saved = errno;
+        close(w->wake_fd[0]); close(w->wake_fd[1]);
+        w->wake_fd[0] = w->wake_fd[1] = -1;
+        errno = saved;
+        return -1;
+    }
     if (ds4_session_create(&w->session, engine, cfg->gen.ctx_size) != 0) {
         fprintf(stderr, "ds4-agent: session backend is required\n");
         return -1;
@@ -12688,7 +12972,7 @@ static int agent_worker_init(agent_worker *w, ds4_engine *engine, agent_config *
         return -1;
     }
     ds4_web_config web_cfg = {
-        .home_dir = getenv("HOME"),
+        .home_dir = agent_home_dir(),
         .port = 9333,
         .confirm = agent_web_confirm,
         .confirm_privdata = w,
@@ -12708,6 +12992,7 @@ static int agent_worker_init(agent_worker *w, ds4_engine *engine, agent_config *
         }
     }
     if (pthread_create(&w->thread, NULL, worker_main, w) != 0) return -1;
+    w->thread_started = true;
     return 0;
 }
 
@@ -12715,7 +13000,7 @@ static int agent_worker_init(agent_worker *w, ds4_engine *engine, agent_config *
  * process groups. */
 static void agent_worker_free(agent_worker *w) {
     worker_stop(w);
-    if (w->thread) pthread_join(w->thread, NULL);
+    if (w->thread_started) pthread_join(w->thread, NULL);
     agent_bash_jobs_free(w);
     ds4_web_free(w->web);
     ds4_session_free(w->session);
@@ -12802,7 +13087,47 @@ static bool agent_prompt_yes_no_ex(const char *prompt,
         if (saved_flags >= 0 && (saved_flags & O_NONBLOCK)) {
             fcntl(STDIN_FILENO, F_SETFL, saved_flags & ~O_NONBLOCK);
         }
-        bool got_line = fgets(buf, sizeof(buf), stdin) != NULL;
+        bool got_line;
+#ifdef _WIN32
+        DWORD console_mode;
+        if (GetConsoleMode(GetStdHandle(STD_INPUT_HANDLE), &console_mode)) {
+            size_t used = 0;
+            got_line = false;
+            for (;;) {
+                if (use_timeout && now_sec() >= deadline) {
+                    if (timed_out) *timed_out = true;
+                    printf("\n");
+                    return auto_answer == AGENT_YES_NO_AUTO_YES;
+                }
+                char c;
+                ssize_t n = agent_stdin_read(&c, 1);
+                if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR)) {
+                    Sleep(10);
+                    continue;
+                }
+                if (n <= 0 || c == 3 || c == 4) break;
+                if (c == '\r' || c == '\n') {
+                    if (console_mode & ENABLE_ECHO_INPUT) printf("\n");
+                    buf[used] = 0;
+                    got_line = true;
+                    break;
+                }
+                if (c == '\b' || c == 127) {
+                    if (used) {
+                        used--;
+                        if (console_mode & ENABLE_ECHO_INPUT) printf("\b \b");
+                    }
+                } else if (used + 1 < sizeof(buf)) {
+                    buf[used++] = c;
+                    if (console_mode & ENABLE_ECHO_INPUT) putchar(c);
+                }
+                fflush(stdout);
+            }
+        } else
+#endif
+        {
+            got_line = fgets(buf, sizeof(buf), stdin) != NULL;
+        }
         if (saved_flags >= 0 && (saved_flags & O_NONBLOCK)) {
             fcntl(STDIN_FILENO, F_SETFL, saved_flags);
         }
@@ -12861,7 +13186,7 @@ static void agent_noninteractive_marker(const char *msg) {
 static int agent_read_stdin_available(agent_input_buf *in, bool *eof) {
     char buf[4096];
     for (;;) {
-        ssize_t n = read(STDIN_FILENO, buf, sizeof(buf));
+        ssize_t n = agent_stdin_read(buf, sizeof(buf));
         if (n > 0) {
             agent_input_buf_append(in, buf, (size_t)n);
             continue;
@@ -12897,6 +13222,7 @@ static int run_agent_non_interactive(ds4_engine *engine, agent_config *cfg) {
     double quiet_deadline = 0.0;
     int rc = 0;
 
+#ifndef _WIN32
     if (!one_shot) {
         if (set_nonblock(STDIN_FILENO, true, &old_stdin_flags) != 0) {
             perror("ds4-agent: nonblocking stdin");
@@ -12905,6 +13231,7 @@ static int run_agent_non_interactive(ds4_engine *engine, agent_config *cfg) {
         }
         stdin_nonblock = true;
     }
+#endif
 
     while (true) {
         bool initialized = worker_is_initialized(&worker, NULL);
@@ -13041,8 +13368,7 @@ static int run_agent(ds4_engine *engine, agent_config *cfg) {
     if (agent_worker_init(&worker, engine, cfg) != 0) return 1;
 
     char hist[PATH_MAX];
-    const char *home = getenv("HOME");
-    if (!home || !home[0]) home = ".";
+    const char *home = agent_home_dir();
     snprintf(hist, sizeof(hist), "%s/.ds4_agent_history", home);
     /* The agent uses ANSI scroll regions when possible: model/tool output
      * scrolls above the live linenoise prompt and status footer, so streaming
@@ -13102,7 +13428,13 @@ static int run_agent(ds4_engine *engine, agent_config *cfg) {
             }
         }
 
+#ifdef _WIN32
+        /* The console decoder can retain UTF-8 bytes after the native event
+         * queue empties, so drain it even when poll has no fresh event. */
+        editor_read_stdin(&editor);
+#else
         if (rc > 0 && (pfd[0].revents & POLLIN)) editor_read_stdin(&editor);
+#endif
 
         /* Linenoise runs the terminal in raw mode, so Ctrl+C normally arrives
          * as byte 3 instead of SIGINT.  Handle it before worker output is

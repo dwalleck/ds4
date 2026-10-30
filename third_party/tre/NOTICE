@@ -1,0 +1,45 @@
+TRE POSIX regular-expression library
+====================================
+Upstream: https://github.com/laurikari/tre
+Pinned revision: 71bfcaf0af3994384987c6c2679ed7d078ffe189
+Source URLs: https://raw.githubusercontent.com/laurikari/tre/71bfcaf0af3994384987c6c2679ed7d078ffe189/{lib,include/tre}/...
+License: BSD-2-Clause; the upstream LICENSE is retained verbatim.
+
+Only the exact-matching library sources and their private/public headers are
+vendored. The optional approximate matcher, tools, examples, build system, and
+debug allocator are not part of this integration. POSIX ERE matching (including
+classes, intervals, alternation, captures, leftmost-longest matching, REG_ICASE,
+REG_NOSUB, diagnostics, and deallocation) is implemented by TRE, not translated
+to another expression language.
+
+Local changes:
+- config.h and include/tre/tre-config.h configure C11, UCRT wide/multibyte and
+  character-class functions, malloc-backed matching, and exact matching only.
+- lib/tre-internal.h uses uintptr_t instead of long for pointer arithmetic.
+- lib/tre-mem.c and lib/tre-match-parallel.c align pointer-bearing data using
+  uintptr_t and reserve the matching padding. Windows ARM64 uses LLP64, where
+  long is only 32 bits but pointers require 64-bit alignment.
+- compat/win32/include/regex.h exposes upstream's POSIX names to ds4 C code.
+
+Case folding and multibyte decoding follow the active C runtime locale, as in
+upstream TRE's Windows configuration. The initial C locale is byte-oriented.
+Windows wchar_t is UTF-16, so locale-based multibyte character conversion has
+the UCRT's wchar_t representability limits; no process-global locale is changed
+by this library.
+
+Build exactly these C files, separately (not as an amalgamation):
+  third_party/tre/lib/regcomp.c
+  third_party/tre/lib/regexec.c
+  third_party/tre/lib/regerror.c
+  third_party/tre/lib/tre-ast.c
+  third_party/tre/lib/tre-compile.c
+  third_party/tre/lib/tre-match-backtrack.c
+  third_party/tre/lib/tre-match-parallel.c
+  third_party/tre/lib/tre-mem.c
+  third_party/tre/lib/tre-parse.c
+  third_party/tre/lib/tre-stack.c
+
+For clang-cl, add /Ithird_party/tre/include for consumers and these sources.
+Force-include /FIthird_party/tre/config.h for only the ten TRE sources above.
+Do not define HAVE_CONFIG_H (the configuration is force-included directly).
+No external libraries or generated files are required.

@@ -17,6 +17,9 @@
  * and F16 APE, every pos0 phase around window boundaries, n_rows 1..8, with
  * and without snapshots, and -inf scores in the initial state. */
 #include "ds4_gpu.h"
+#ifdef _WIN32
+#include "compat/win32/platform.h"
+#endif
 
 #include <errno.h>
 #include <math.h>
@@ -274,7 +277,12 @@ int main(int argc, char **argv) {
         CHECK(raw_dump);
     }
     model_buf m = make_model();
+#ifdef _WIN32
+    char path[32768];
+    CHECK(ds4_win32_temp_path(path, sizeof(path), "ds4-compressor-rows-XXXXXX") == 0);
+#else
     char path[] = "/tmp/ds4-compressor-rows-XXXXXX";
+#endif
     const int fd = mkstemp(path);
     CHECK(fd >= 0);
     CHECK(unlink(path) == 0);

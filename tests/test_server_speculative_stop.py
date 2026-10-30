@@ -3,8 +3,8 @@
 
 Example: python3 tests/test_server_speculative_stop.py --output /tmp/stop-check
 Use --approx-tokens 16384 for the longer story; sizes are character proxies,
-not token counts. Requires Linux/macOS SIGALRM. No server startup or tool/code
-execution. Each case echoes the actual assistant reply before its follow-up.
+not token counts. Absolute deadlines use SIGALRM on Unix and socket shutdown
+on Windows. No server startup or tool/code execution. Each case echoes the actual assistant reply before its follow-up.
 Raw requests, SSE bytes/events, replies, timings and failures are retained.
 TTFT counts nonempty content/reasoning/tool deltas, not role-only events.
 The tail is last such delta to body EOF. Network buffering affects timings;
@@ -12,10 +12,13 @@ this is not an internal-state oracle or a scalar free-generation comparison.
 """
 
 import argparse
+import http.client
 import json
 from pathlib import Path
 import signal
 import sys
+import socket
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -61,6 +64,51 @@ def story(size):
     return OPENING + "\n".join(scenes)
 
 
+class WindowsHTTPDeadline:
+    """Interrupt a blocking HTTP/S read without Unix process signals."""
+
+    def __init__(self, timeout):
+        self.expired = threading.Event()
+        self.transport = None
+        self.timer = threading.Timer(timeout, self.expire)
+        self.timer.daemon = True
+
+    def expire(self):
+        self.expired.set()
+        if self.transport is not None:
+            try:
+                self.transport.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+
+    def handlers(self):
+        deadline = self
+
+        def connection_type(base):
+            class Connection(base):
+                def connect(self):
+                    super().connect()
+                    deadline.transport = self.sock
+                    if deadline.expired.is_set():
+                        deadline.expire()
+                        self.close()
+                        raise TimeoutError("absolute HTTP deadline exceeded")
+            return Connection
+
+        http_connection = connection_type(http.client.HTTPConnection)
+        https_connection = connection_type(http.client.HTTPSConnection)
+
+        class HTTPHandler(urllib.request.HTTPHandler):
+            def http_open(self, request):
+                return self.do_open(http_connection, request)
+
+        class HTTPSHandler(urllib.request.HTTPSHandler):
+            def https_open(self, request):
+                return self.do_open(https_connection, request, context=self._context)
+
+        return HTTPHandler(), HTTPSHandler()
+
+
 def post(args, body, directory):
     directory.mkdir()
     save(directory / "request.json", body)
@@ -69,14 +117,19 @@ def post(args, body, directory):
     start = time.monotonic()
     def expired(signum, frame):
         raise TimeoutError("absolute HTTP deadline exceeded")
-    previous = signal.signal(signal.SIGALRM, expired)
-    signal.setitimer(signal.ITIMER_REAL, args.timeout)
+    deadline = WindowsHTTPDeadline(args.timeout) if sys.platform == "win32" else None
+    if deadline is not None:
+        deadline.timer.start()
+    else:
+        previous = signal.signal(signal.SIGALRM, expired)
+        signal.setitimer(signal.ITIMER_REAL, args.timeout)
     try:
         url = args.url.rstrip("/")
         url += "/chat/completions" if url.endswith("/v1") else "/v1/chat/completions"
         request = urllib.request.Request(url, json.dumps(body).encode(),
                                          {"Content-Type": "application/json", "Connection": "close"})
-        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+        handlers = deadline.handlers() if deadline is not None else ()
+        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), *handlers)
         try:
             response = opener.open(request, timeout=args.timeout)
         except urllib.error.HTTPError as exc:
@@ -159,11 +212,18 @@ def post(args, body, directory):
             check(done and not pending and "last_delta_s" in timing, "incomplete/empty SSE reply")
             timing["final_delay_s"] = timing["eof_s"] - timing["last_delta_s"]
     except Exception as exc:
+        if deadline is not None and deadline.expired.is_set():
+            result["error"] = "absolute HTTP deadline exceeded"
+            raise TimeoutError(result["error"]) from exc
         result["error"] = str(exc)
         raise
     finally:
-        signal.setitimer(signal.ITIMER_REAL, 0)
-        signal.signal(signal.SIGALRM, previous)
+        if deadline is not None:
+            deadline.timer.cancel()
+            deadline.timer.join()
+        else:
+            signal.setitimer(signal.ITIMER_REAL, 0)
+            signal.signal(signal.SIGALRM, previous)
         timing["elapsed_s"] = time.monotonic() - start
         if calls:
             message["tool_calls"] = list(calls.values())

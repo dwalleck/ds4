@@ -40,6 +40,9 @@
 #include <stdarg.h>
 #include <time.h>
 #include <unistd.h>
+#ifdef _WIN32
+#include "compat/win32/platform.h"
+#endif
 
 #include "ds4.h"
 #include "ds4_tool_text.h"
@@ -61063,7 +61066,16 @@ static void ds4_release_instance_lock(void) {
  * stale accidental second run is more dangerous than a normal CLI error. */
 static void ds4_acquire_instance_lock(void) {
     const char *path = getenv("DS4_LOCK_FILE");
+#ifdef _WIN32
+    char default_path[32768];
+    if (!path || !path[0]) {
+        if (ds4_win32_temp_path(default_path, sizeof(default_path), "ds4.lock") != 0)
+            ds4_die_errno("cannot resolve instance lock directory", "Windows temporary directory");
+        path = default_path;
+    }
+#else
     if (!path || !path[0]) path = "/tmp/ds4.lock";
+#endif
 
     const int fd = open(path, O_RDWR | O_CREAT, 0600);
     if (fd < 0) {
@@ -63619,7 +63631,15 @@ int ds4_session_stage_payload(ds4_session *s, ds4_session_payload_file *out,
         return 1;
     }
 
+#ifdef _WIN32
+    char tmpl[32768];
+    if (ds4_win32_temp_path(tmpl, sizeof(tmpl), "ds4-session-payload.XXXXXX") != 0) {
+        payload_set_err(err, errlen, "failed to resolve session payload directory");
+        return 1;
+    }
+#else
     char tmpl[] = "/tmp/ds4-session-payload.XXXXXX";
+#endif
     int fd = mkstemp(tmpl);
     if (fd < 0) {
         payload_set_err(err, errlen, "failed to create staged session payload");
@@ -71722,6 +71742,17 @@ int ds4_engine_create_with_gpu_config(ds4_engine **out,
 static int ds4_engine_open_internal(ds4_engine **out,
                                      const ds4_engine_options *opt,
                                      const ds4_gpu_config *gpu_cfg) {
+#ifdef _WIN32
+    /* Reject direct API callers before opening weights or touching transport. */
+    if (opt->distributed.role != DS4_DISTRIBUTED_NONE ||
+        opt->tp.requested || opt->tp.role != DS4_TP_NONE ||
+        opt->cuda_tensor_parallel || (gpu_cfg && gpu_cfg->n_gpus > 1)) {
+        fprintf(stderr, "ds4: Windows currently supports single-GPU local inference only; "
+                        "distributed, RDMA, and multi-GPU modes are unavailable\n");
+        *out = NULL;
+        return 1;
+    }
+#endif
     ds4_engine *e = xcalloc(1, sizeof(*e));
 #if defined(DS4_ROCM_BUILD) && !defined(DS4_NO_GPU)
     g_glm_rocm_guard_available_baseline = 0;

@@ -85,7 +85,8 @@ int ds4_tp_adopt_distributed_options(
 void ds4_tp_usage(FILE *fp);
 
 /* Validates option combinations that TP cannot run with (SSD streaming,
- * distributed mode, MTP drafting, CPU backend). */
+ * distributed mode, MTP drafting, CPU backend). Windows rejects all TP/RDMA
+ * options; default single-device options remain valid. */
 int ds4_tp_validate_engine_options(
         const ds4_engine_options *opt,
         char *err,

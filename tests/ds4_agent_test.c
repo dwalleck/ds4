@@ -1,7 +1,9 @@
 #define DS4_AGENT_TEST
 #define DS4_AGENT_TEST_NO_MAIN
 #include "../ds4_agent.c"
+#ifndef _WIN32
 #include <sys/resource.h>
+#endif
 #if defined(__APPLE__) || defined(__linux__)
 #include <sys/xattr.h>
 #endif
@@ -29,7 +31,8 @@ static int test_write_file(const char *path, const char *data, size_t len,
 }
 
 static void test_atomic_file_tools(void) {
-    char dir[] = "/tmp/ds4-agent-files-XXXXXX";
+    char dir[PATH_MAX];
+    AGENT_TEST_ASSERT(agent_temp_template(dir, sizeof(dir), "ds4-agent-files") == 0);
     AGENT_TEST_ASSERT(mkdtemp(dir) != NULL);
     char path[PATH_MAX], linkpath[PATH_MAX], err[256];
     snprintf(path, sizeof(path), "%s/file", dir);
@@ -37,6 +40,7 @@ static void test_atomic_file_tools(void) {
     char original[4096];
     memset(original, 'x', sizeof(original));
     AGENT_TEST_ASSERT(test_write_file(path, original, sizeof(original), err, sizeof(err)) == 0);
+#ifndef _WIN32
     AGENT_TEST_ASSERT(chmod(path, 0751) == 0);
 #ifdef __APPLE__
     AGENT_TEST_ASSERT(setxattr(path, "com.ds4.agent-test", "keep", 4, 0, 0) == 0);
@@ -57,6 +61,15 @@ static void test_atomic_file_tools(void) {
     int status = 0;
     if (child > 0) waitpid(child, &status, 0);
     AGENT_TEST_ASSERT(WIFEXITED(status) && WEXITSTATUS(status) == 0);
+#else
+    wchar_t wide_path[PATH_MAX];
+    AGENT_TEST_ASSERT(MultiByteToWideChar(CP_UTF8, 0, path, -1, wide_path, PATH_MAX) != 0);
+    HANDLE locked = CreateFileW(wide_path, GENERIC_READ, FILE_SHARE_READ, NULL,
+                                 OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+    AGENT_TEST_ASSERT(locked != INVALID_HANDLE_VALUE);
+    AGENT_TEST_ASSERT(test_write_file(path, "bad", 3, err, sizeof(err)) == -1);
+    if (locked != INVALID_HANDLE_VALUE) CloseHandle(locked);
+#endif
     char *data = NULL;
     size_t len = 0;
     AGENT_TEST_ASSERT(agent_read_file_bytes(path, &data, &len, err, sizeof(err)) == 0);
@@ -65,6 +78,7 @@ static void test_atomic_file_tools(void) {
     AGENT_TEST_ASSERT(agent_replace_file(path, "bad", 3, "stale", 5, err, sizeof(err)) == -1);
     AGENT_TEST_ASSERT(strstr(err, "changed") != NULL);
 
+#ifndef _WIN32
     AGENT_TEST_ASSERT(symlink("file", linkpath) == 0);
     AGENT_TEST_ASSERT(test_write_file(linkpath, "new", 3, err, sizeof(err)) == 0);
     struct stat st;
@@ -80,11 +94,20 @@ static void test_atomic_file_tools(void) {
     AGENT_TEST_ASSERT(getxattr(path, "user.ds4-agent-test", attribute, sizeof(attribute)) == 4);
     AGENT_TEST_ASSERT(!memcmp(attribute, "keep", 4));
 #endif
+#else
+    AGENT_TEST_ASSERT(test_write_file(path, "new", 3, err, sizeof(err)) == 0);
+#endif
     AGENT_TEST_ASSERT(agent_read_file_bytes(path, &data, &len, err, sizeof(err)) == 0);
     AGENT_TEST_ASSERT(len == 3 && !memcmp(data, "new", 3));
     free(data);
     unlink(linkpath);
+#ifdef _WIN32
+    wchar_t wide_link[PATH_MAX];
+    AGENT_TEST_ASSERT(MultiByteToWideChar(CP_UTF8, 0, linkpath, -1, wide_link, PATH_MAX) != 0);
+    AGENT_TEST_ASSERT(CreateHardLinkW(wide_link, wide_path, NULL) != 0);
+#else
     AGENT_TEST_ASSERT(link(path, linkpath) == 0);
+#endif
     AGENT_TEST_ASSERT(test_write_file(path, "bad", 3, err, sizeof(err)) == -1);
     AGENT_TEST_ASSERT(strstr(err, "hard-linked") != NULL);
     unlink(linkpath);
@@ -101,7 +124,8 @@ static void test_atomic_file_tools(void) {
 }
 
 static void test_streaming_file_tools(void) {
-    char path[] = "/tmp/ds4-agent-read-XXXXXX";
+    char path[PATH_MAX];
+    AGENT_TEST_ASSERT(agent_temp_template(path, sizeof(path), "ds4-agent-read") == 0);
     int fd = mkstemp(path);
     AGENT_TEST_ASSERT(fd >= 0);
     FILE *fp = fdopen(fd, "wb");
@@ -125,6 +149,7 @@ static void test_streaming_file_tools(void) {
     agent_tool_call call = {0};
     test_tool_arg(&call, "path", path);
     test_tool_arg(&call, "query", "needle");
+#ifndef _WIN32
     char linkpath[PATH_MAX];
     snprintf(linkpath, sizeof(linkpath), "%s-link", path);
     AGENT_TEST_ASSERT(symlink(path, linkpath) == 0);
@@ -136,6 +161,7 @@ static void test_streaming_file_tools(void) {
     free(text);
     agent_tool_call_free(&linked);
     unlink(linkpath);
+#endif
     text = agent_tool_search(&w, &call);
     AGENT_TEST_ASSERT(strstr(text, "2 matches") && strstr(text, "needle last"));
     free(text);
@@ -170,12 +196,14 @@ static void test_streaming_file_tools(void) {
     AGENT_TEST_ASSERT(strlen(text) < AGENT_TOOL_MAX_BYTES && w.more_valid);
     free(text);
     unlink(path);
+#ifndef _WIN32
     AGENT_TEST_ASSERT(mkfifo(path, 0600) == 0);
     double started = now_sec();
     text = agent_read_range(&w, path, 1, 1, false, false, true);
     AGENT_TEST_ASSERT(strstr(text, "Tool error:") && now_sec() - started < 0.5);
     free(text);
     unlink(path);
+#endif
     test_tool_arg(&call, "path", path);
     test_tool_arg(&call, "query", "needle");
     text = agent_tool_search(&w, &call);
@@ -209,7 +237,25 @@ static void test_shell_spawn(void) {
     w.wake_fd[0] = w.wake_fd[1] = -1;
     char err[256], cwd[PATH_MAX];
     AGENT_TEST_ASSERT(getcwd(cwd, sizeof(cwd)) != NULL);
-    setenv("DS4_TEST_SHELL_ENV", "inherited", 1);
+#ifdef _WIN32
+    const char *configured_shell = getenv("DS4_SHELL");
+    char *saved_shell = configured_shell ? xstrdup(configured_shell) : NULL;
+    char missing_shell[PATH_MAX];
+    AGENT_TEST_ASSERT(agent_temp_template(missing_shell, sizeof(missing_shell), "ds4-missing-shell") == 0);
+    setenv("DS4_SHELL", missing_shell, 1);
+    agent_bash_job *missing = agent_bash_start(&w, "printf must-not-run", 5, err, sizeof(err));
+    AGENT_TEST_ASSERT(missing == NULL && strstr(err, "DS4_SHELL"));
+    if (missing) {
+        char output[PATH_MAX];
+        snprintf(output, sizeof(output), "%s", missing->path);
+        agent_bash_remove_job(&w, missing);
+        unlink(output);
+    }
+    if (saved_shell) setenv("DS4_SHELL", saved_shell, 1);
+    else unsetenv("DS4_SHELL");
+    free(saved_shell);
+#endif
+    setenv("DS4_TEST_SHELL_ENV", "inherited \"quoted\" C:\\tail\\ & $(printf BAD)", 1);
     for (int closed_stdio = 0; closed_stdio <= 1; closed_stdio++) {
         int saved[3];
         if (closed_stdio) {
@@ -222,11 +268,21 @@ static void test_shell_spawn(void) {
             for (int i = 0; i < 3; i++) close(i);
         }
         agent_bash_job *job = agent_bash_start(&w,
-            "read line || printf 'stdin-eof\\n'; pwd; "
+            "read line || printf 'stdin-eof\\n'; "
+#ifdef _WIN32
+            "cygpath -w \"$PWD\"; "
+#else
+            "pwd; "
+#endif
             "printf 'env=%s\\n' \"$DS4_TEST_SHELL_ENV\"; "
+            "printf '<%s>\\n' '' 'a b' 'a\"b' 'a\\b' 'ends\\'; "
             "printf 'stderr-captured\\n' >&2; sleep 0.1; exit 23",
             5, err, sizeof(err));
+#ifdef _WIN32
+        bool group_ok = job != NULL; /* Descendant cleanup is tested below. */
+#else
         bool group_ok = job && getpgid(job->pid) == job->pid;
+#endif
         double start = now_sec();
         while (job && agent_bash_is_running(job) && now_sec() - start < 6)
             usleep(10000);
@@ -247,7 +303,8 @@ static void test_shell_spawn(void) {
             AGENT_TEST_ASSERT(strstr(obs, "exit_status=23"));
             AGENT_TEST_ASSERT(strstr(obs, "stdin-eof"));
             AGENT_TEST_ASSERT(strstr(obs, cwd));
-            AGENT_TEST_ASSERT(strstr(obs, "env=inherited"));
+            AGENT_TEST_ASSERT(strstr(obs, "env=inherited \"quoted\" C:\\tail\\ & $(printf BAD)"));
+            AGENT_TEST_ASSERT(strstr(obs, "<>\n<a b>\n<a\"b>\n<a\\b>\n<ends\\>\n"));
             AGENT_TEST_ASSERT(strstr(obs, "stderr-captured"));
         }
         free(obs);
@@ -261,12 +318,14 @@ static void test_background_jobs(void) {
     agent_worker w = {0};
     pthread_mutex_init(&w.mu, NULL);
     w.wake_fd[0] = w.wake_fd[1] = -1;
-    char err[256], marker[] = "/tmp/ds4-agent-deadline-XXXXXX";
+    char err[256], marker[PATH_MAX];
+    AGENT_TEST_ASSERT(agent_temp_template(marker, sizeof(marker), "ds4-agent-deadline") == 0);
     int fd = mkstemp(marker);
     close(fd);
     unlink(marker);
     char cmd[PATH_MAX + 128];
-    snprintf(cmd, sizeof(cmd), "sleep 2; printf late > %s", marker);
+    setenv("DS4_TEST_MARKER", marker, 1);
+    strcpy(cmd, "sleep 2; printf late > \"$DS4_TEST_MARKER\"");
     agent_bash_job *job = agent_bash_start(&w, cmd, 1, err, sizeof(err));
     AGENT_TEST_ASSERT(job != NULL);
     if (!job) goto done;
@@ -279,6 +338,28 @@ static void test_background_jobs(void) {
     free(obs);
     unlink(job->path);
     agent_bash_remove_job(&w, job);
+
+    /* Stop must kill grandchildren too, even when the shell is only waiting. */
+    strcpy(cmd, "(sleep 2; printf escaped > \"$DS4_TEST_MARKER\") & printf 'armed\\n'; wait");
+    job = agent_bash_start(&w, cmd, 5, err, sizeof(err));
+    AGENT_TEST_ASSERT(job != NULL);
+    if (!job) goto done;
+    double armed_deadline = now_sec() + 1.0;
+    bool armed = false;
+    while (!armed && now_sec() < armed_deadline) {
+        obs = agent_bash_observation(job, true, &finished);
+        armed = strstr(obs, "armed") != NULL;
+        free(obs);
+        if (!armed) usleep(10000);
+    }
+    AGENT_TEST_ASSERT(armed);
+    agent_bash_signal(job, SIGKILL);
+    char cancelled_path[PATH_MAX];
+    snprintf(cancelled_path, sizeof(cancelled_path), "%s", job->path);
+    agent_bash_remove_job(&w, job);
+    unlink(cancelled_path);
+    usleep(2400000);
+    AGENT_TEST_ASSERT(access(marker, F_OK) != 0);
 
     job = agent_bash_start(&w, "(sleep 0.1; printf descendant-output) &", 5, err, sizeof(err));
     AGENT_TEST_ASSERT(job != NULL);
@@ -343,6 +424,7 @@ static void test_background_jobs(void) {
 done:
     agent_bash_jobs_free(&w);
     unlink(marker);
+    unsetenv("DS4_TEST_MARKER");
     free(w.out);
     pthread_mutex_destroy(&w.mu);
 }
@@ -940,7 +1022,8 @@ static int test_full_context_save(const char *model) {
     agent_worker w = {.cfg = &cfg, .initialized = true, .user_activity = true,
         .wake_fd = {-1, -1}, .status = {.state = AGENT_WORKER_IDLE}};
     pthread_mutex_init(&w.mu, NULL);
-    char dir[] = "/tmp/ds4-agent-full-save-XXXXXX";
+    char dir[PATH_MAX];
+    AGENT_TEST_ASSERT(agent_temp_template(dir, sizeof(dir), "ds4-agent-full-save") == 0);
     AGENT_TEST_ASSERT(mkdtemp(dir) != NULL);
     w.cache_dir = dir;
     w.session_title = xstrdup("Full transcript recovery");

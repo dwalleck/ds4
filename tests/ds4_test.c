@@ -6,6 +6,27 @@
 #include "../ds4_gpu.h"
 #include "../ds4_image.h"
 #include <math.h>
+#ifdef _WIN32
+#include <malloc.h>
+#endif
+
+static int test_aligned_alloc(void **out, size_t alignment, size_t size) {
+#ifdef _WIN32
+    if (alignment < sizeof(void *) || (alignment & (alignment - 1))) return EINVAL;
+    *out = _aligned_malloc(size, alignment);
+    return *out ? 0 : ENOMEM;
+#else
+    return posix_memalign(out, alignment, size);
+#endif
+}
+
+static void test_aligned_free(void *ptr) {
+#ifdef _WIN32
+    _aligned_free(ptr);
+#else
+    free(ptr);
+#endif
+}
 
 bool ds4_test_dspark_cache_window_crop(void);
 bool ds4_test_dspark_prefix_capture(ds4_engine *engine, const ds4_tokens *prompt);
@@ -886,7 +907,7 @@ static void test_metal_f16_matvec_fast_nr0_4(void) {
     const uint64_t weight_alloc = test_round_up_u64(weight_bytes, (uint64_t)getpagesize());
 
     void *weights_raw = NULL;
-    TEST_ASSERT(posix_memalign(&weights_raw, (size_t)getpagesize(), (size_t)weight_alloc) == 0);
+    TEST_ASSERT(test_aligned_alloc(&weights_raw, (size_t)getpagesize(), (size_t)weight_alloc) == 0);
     if (!weights_raw) return;
 
     uint16_t *weights = weights_raw;
@@ -905,7 +926,7 @@ static void test_metal_f16_matvec_fast_nr0_4(void) {
     if (!x || !out) {
         ds4_gpu_tensor_free(x);
         ds4_gpu_tensor_free(out);
-        free(weights_raw);
+        test_aligned_free(weights_raw);
         return;
     }
 
@@ -918,7 +939,7 @@ static void test_metal_f16_matvec_fast_nr0_4(void) {
         free(out_host);
         ds4_gpu_tensor_free(x);
         ds4_gpu_tensor_free(out);
-        free(weights_raw);
+        test_aligned_free(weights_raw);
         return;
     }
 
@@ -949,7 +970,7 @@ static void test_metal_f16_matvec_fast_nr0_4(void) {
     free(out_host);
     ds4_gpu_tensor_free(x);
     ds4_gpu_tensor_free(out);
-    free(weights_raw);
+    test_aligned_free(weights_raw);
 }
 
 static void test_metal_f16_prefill_matmul(void) {
@@ -962,7 +983,7 @@ static void test_metal_f16_prefill_matmul(void) {
     const uint64_t out_bytes = (uint64_t)n_tok * out_dim * sizeof(float);
 
     void *weights_raw = NULL;
-    TEST_ASSERT(posix_memalign(&weights_raw, (size_t)getpagesize(), (size_t)weight_alloc) == 0);
+    TEST_ASSERT(test_aligned_alloc(&weights_raw, (size_t)getpagesize(), (size_t)weight_alloc) == 0);
     if (!weights_raw) return;
 
     uint16_t *weights = weights_raw;
@@ -981,7 +1002,7 @@ static void test_metal_f16_prefill_matmul(void) {
     if (!x || !out) {
         ds4_gpu_tensor_free(x);
         ds4_gpu_tensor_free(out);
-        free(weights_raw);
+        test_aligned_free(weights_raw);
         return;
     }
 
@@ -994,7 +1015,7 @@ static void test_metal_f16_prefill_matmul(void) {
         free(out_host);
         ds4_gpu_tensor_free(x);
         ds4_gpu_tensor_free(out);
-        free(weights_raw);
+        test_aligned_free(weights_raw);
         return;
     }
 
@@ -1040,7 +1061,7 @@ static void test_metal_f16_prefill_matmul(void) {
     free(out_host);
     ds4_gpu_tensor_free(x);
     ds4_gpu_tensor_free(out);
-    free(weights_raw);
+    test_aligned_free(weights_raw);
 }
 
 static void test_metal_q8_0_prefill_matmul(void) {
@@ -1054,7 +1075,7 @@ static void test_metal_q8_0_prefill_matmul(void) {
     const uint64_t out_bytes = (uint64_t)n_tok * out_dim * sizeof(float);
 
     void *weights_raw = NULL;
-    TEST_ASSERT(posix_memalign(&weights_raw, (size_t)getpagesize(), (size_t)weight_alloc) == 0);
+    TEST_ASSERT(test_aligned_alloc(&weights_raw, (size_t)getpagesize(), (size_t)weight_alloc) == 0);
     if (!weights_raw) return;
 
     uint8_t *weights = weights_raw;
@@ -1068,7 +1089,7 @@ static void test_metal_q8_0_prefill_matmul(void) {
     if (!x || !out) {
         ds4_gpu_tensor_free(x);
         ds4_gpu_tensor_free(out);
-        free(weights_raw);
+        test_aligned_free(weights_raw);
         return;
     }
 
@@ -1081,7 +1102,7 @@ static void test_metal_q8_0_prefill_matmul(void) {
         free(out_host);
         ds4_gpu_tensor_free(x);
         ds4_gpu_tensor_free(out);
-        free(weights_raw);
+        test_aligned_free(weights_raw);
         return;
     }
 
@@ -1134,7 +1155,7 @@ static void test_metal_q8_0_prefill_matmul(void) {
     free(out_host);
     ds4_gpu_tensor_free(x);
     ds4_gpu_tensor_free(out);
-    free(weights_raw);
+    test_aligned_free(weights_raw);
 }
 
 static void test_metal_pack_slot_rows_f32(void) {
@@ -1284,7 +1305,7 @@ static void test_metal_q8_0_decode_pair_exact_case(
         test_round_up_u64(weight1_offset + weight1_bytes, page);
 
     void *weights_raw = NULL;
-    TEST_ASSERT(posix_memalign(&weights_raw, (size_t)page, (size_t)weight_alloc) == 0);
+    TEST_ASSERT(test_aligned_alloc(&weights_raw, (size_t)page, (size_t)weight_alloc) == 0);
     if (!weights_raw) return;
     memset(weights_raw, 0, (size_t)weight_alloc);
     test_fill_q8_0_weights((uint8_t *)weights_raw, in_dim, out0_dim, seed0);
@@ -1310,7 +1331,7 @@ static void test_metal_q8_0_decode_pair_exact_case(
         ds4_gpu_tensor_free(ref1);
         ds4_gpu_tensor_free(pair0);
         ds4_gpu_tensor_free(pair1);
-        free(weights_raw);
+        test_aligned_free(weights_raw);
         return;
     }
 
@@ -1335,7 +1356,7 @@ static void test_metal_q8_0_decode_pair_exact_case(
         ds4_gpu_tensor_free(ref1);
         ds4_gpu_tensor_free(pair0);
         ds4_gpu_tensor_free(pair1);
-        free(weights_raw);
+        test_aligned_free(weights_raw);
         return;
     }
 
@@ -1395,7 +1416,7 @@ static void test_metal_q8_0_decode_pair_exact_case(
     ds4_gpu_tensor_free(ref1);
     ds4_gpu_tensor_free(pair0);
     ds4_gpu_tensor_free(pair1);
-    free(weights_raw);
+    test_aligned_free(weights_raw);
 }
 
 static void test_metal_q8_0_decode_pair_exact(void) {
@@ -1441,7 +1462,7 @@ static void test_metal_f16_compressor_pair_state_store_exact_case(
     const uint64_t comp_bytes = (uint64_t)head_dim * sizeof(float);
 
     void *model_raw = NULL;
-    TEST_ASSERT(posix_memalign(&model_raw, (size_t)page,
+    TEST_ASSERT(test_aligned_alloc(&model_raw, (size_t)page,
                                (size_t)model_bytes) == 0);
     ds4_gpu_tensor *x = ds4_gpu_tensor_alloc(x_bytes);
     ds4_gpu_tensor *ref_kv = ds4_gpu_tensor_alloc(out_bytes);
@@ -1777,7 +1798,7 @@ static void test_metal_f16_compressor_pair_state_store_exact_case(
     ds4_gpu_tensor_free(ref_score);
     ds4_gpu_tensor_free(ref_kv);
     ds4_gpu_tensor_free(x);
-    free(model_raw);
+    test_aligned_free(model_raw);
 }
 
 static void test_metal_f16_compressor_pair_state_store_exact(void) {
@@ -1856,7 +1877,7 @@ static void test_metal_compressor_ape_add_exact_case(
     TEST_ASSERT(!test_pack_fusion || poison_host != NULL);
 
     void *model_raw = NULL;
-    TEST_ASSERT(posix_memalign(&model_raw, (size_t)page,
+    TEST_ASSERT(test_aligned_alloc(&model_raw, (size_t)page,
                                (size_t)model_bytes) == 0);
     const bool allocated = kv && sc && ref_comp && fused_comp && ref_state_kv &&
         ref_state_score && fused_state_kv && fused_state_score && kv_host &&
@@ -2067,7 +2088,7 @@ static void test_metal_compressor_ape_add_exact_case(
     TEST_ASSERT(state_kv_stats.mismatch_count == 0);
     TEST_ASSERT(state_score_stats.mismatch_count == 0);
 
-    free(model_raw);
+    test_aligned_free(model_raw);
     free(poison_host);
     free(fused_state_score_host);
     free(fused_state_kv_host);
@@ -2138,7 +2159,7 @@ static void test_metal_compressor_ratio4_replay_pack_exact_case(
     float *ref_state_score_host = malloc((size_t)state_bytes);
     float *fused_state_score_host = malloc((size_t)state_bytes);
     void *model_raw = NULL;
-    TEST_ASSERT(posix_memalign(
+    TEST_ASSERT(test_aligned_alloc(
                     &model_raw, (size_t)page, (size_t)model_bytes) == 0);
 
     TEST_ASSERT(kv != NULL);
@@ -2335,7 +2356,7 @@ static void test_metal_compressor_ratio4_replay_pack_exact_case(
     TEST_ASSERT(state_kv_stats.mismatch_count == 0);
     TEST_ASSERT(state_score_stats.mismatch_count == 0);
 
-    free(model_raw);
+    test_aligned_free(model_raw);
     free(fused_state_score_host);
     free(ref_state_score_host);
     free(fused_state_kv_host);
@@ -2409,7 +2430,7 @@ static void test_metal_compressor_ratio4_direct_pool_exact_case(
     float *ref_state_score_host = malloc((size_t)state_bytes);
     float *direct_state_score_host = malloc((size_t)state_bytes);
     void *model_raw = NULL;
-    TEST_ASSERT(posix_memalign(
+    TEST_ASSERT(test_aligned_alloc(
                     &model_raw, (size_t)page, (size_t)model_bytes) == 0);
 
     TEST_ASSERT(kv != NULL);
@@ -2643,7 +2664,7 @@ static void test_metal_compressor_ratio4_direct_pool_exact_case(
     TEST_ASSERT(state_kv_stats.mismatch_count == 0);
     TEST_ASSERT(state_score_stats.mismatch_count == 0);
 
-    free(model_raw);
+    test_aligned_free(model_raw);
     free(direct_state_score_host);
     free(ref_state_score_host);
     free(direct_state_kv_host);
@@ -3427,7 +3448,7 @@ static void test_metal_contiguous_compressed_f16_attention_exact(void) {
     TEST_ASSERT(compute_host != NULL);
 
     void *model_raw = NULL;
-    TEST_ASSERT(posix_memalign(&model_raw, (size_t)page, (size_t)page) == 0);
+    TEST_ASSERT(test_aligned_alloc(&model_raw, (size_t)page, (size_t)page) == 0);
     const bool allocated = raw && comp_base && comp && q && heads_blit &&
         heads_compute && raw_host && comp_host && q_host && blit_host &&
         compute_host && model_raw;
@@ -3513,7 +3534,7 @@ static void test_metal_contiguous_compressed_f16_attention_exact(void) {
             stats.max_abs);
     TEST_ASSERT(stats.mismatch_count == 0);
 
-    free(model_raw);
+    test_aligned_free(model_raw);
     free(compute_host);
     free(blit_host);
     free(q_host);
@@ -3533,7 +3554,7 @@ static void test_metal_compressed_selection_causality(void) {
     const uint64_t output_bytes = (uint64_t)tokens * heads * dim * sizeof(float);
     const uint64_t page = (uint64_t)getpagesize();
     void *model = NULL;
-    TEST_ASSERT(posix_memalign(&model, (size_t)page, (size_t)page) == 0);
+    TEST_ASSERT(test_aligned_alloc(&model, (size_t)page, (size_t)page) == 0);
     ds4_gpu_tensor *q = ds4_gpu_tensor_alloc(output_bytes);
     ds4_gpu_tensor *out = ds4_gpu_tensor_alloc(output_bytes);
     ds4_gpu_tensor *raw = ds4_gpu_tensor_alloc(tokens * dim * sizeof(float));
@@ -3635,7 +3656,7 @@ static void test_metal_compressed_selection_causality(void) {
     fprintf(stderr, "ds4-test: compressed selection causality mismatches=%zu max_abs=%g\n",
             mismatches, max_error);
     TEST_ASSERT(mismatches == 0);
-    free(actual); free(selected); free(values); free(model);
+    free(actual); free(selected); free(values); test_aligned_free(model);
     ds4_gpu_tensor_free(mask); ds4_gpu_tensor_free(mask_base);
     ds4_gpu_tensor_free(comp_half); ds4_gpu_tensor_free(comp);
     ds4_gpu_tensor_free(raw); ds4_gpu_tensor_free(out); ds4_gpu_tensor_free(q);
@@ -3697,7 +3718,7 @@ static void test_metal_persistent_zero_attention_mask_exact_case(
     TEST_ASSERT(after_mask_host != NULL);
 
     void *model_raw = NULL;
-    TEST_ASSERT(posix_memalign(&model_raw, (size_t)page, (size_t)page) == 0);
+    TEST_ASSERT(test_aligned_alloc(&model_raw, (size_t)page, (size_t)page) == 0);
     const bool allocated = raw && comp && q && comp_mask && legacy &&
         persistent && masked && pad_legacy && after_mask && raw_host &&
         comp_host && q_host && mask_host && legacy_host && persistent_host &&
@@ -3823,7 +3844,7 @@ static void test_metal_persistent_zero_attention_mask_exact_case(
     TEST_ASSERT(pad_stats.mismatch_count == 0);
     TEST_ASSERT(after_mask_stats.mismatch_count == 0);
 
-    free(model_raw);
+    test_aligned_free(model_raw);
     free(after_mask_host);
     free(pad_legacy_host);
     free(masked_host);
@@ -3985,7 +4006,7 @@ static void test_metal_zero_prefix_prefill_mask_cache_exact_kind(
     float *actual = malloc((size_t)q_bytes);
     float *masked_actual = malloc((size_t)q_bytes);
     void *model_raw = NULL;
-    TEST_ASSERT(posix_memalign(&model_raw, (size_t)page, (size_t)page) == 0);
+    TEST_ASSERT(test_aligned_alloc(&model_raw, (size_t)page, (size_t)page) == 0);
 
     TEST_ASSERT(raw != NULL);
     TEST_ASSERT(comp != NULL);
@@ -4134,7 +4155,7 @@ static void test_metal_zero_prefix_prefill_mask_cache_exact_kind(
     TEST_ASSERT(total_mismatches == 0);
     TEST_ASSERT(max_ulp == 0);
 
-    free(model_raw);
+    test_aligned_free(model_raw);
     free(masked_actual);
     free(actual);
     free(ref_b);
@@ -4184,7 +4205,7 @@ static void test_metal_hc_split_weighted_sum_norm_batch_exact(void) {
     const uint64_t out_bytes = (uint64_t)n_rows * n_embd * sizeof(float);
 
     void *model_raw = NULL;
-    TEST_ASSERT(posix_memalign(&model_raw, (size_t)page, (size_t)model_alloc) == 0);
+    TEST_ASSERT(test_aligned_alloc(&model_raw, (size_t)page, (size_t)model_alloc) == 0);
     if (!model_raw) return;
     memset(model_raw, 0, (size_t)model_alloc);
 
@@ -4228,7 +4249,7 @@ static void test_metal_hc_split_weighted_sum_norm_batch_exact(void) {
         ds4_gpu_tensor_free(fused_out);
         ds4_gpu_tensor_free(ref_norm);
         ds4_gpu_tensor_free(fused_norm);
-        free(model_raw);
+        test_aligned_free(model_raw);
         return;
     }
 
@@ -4266,7 +4287,7 @@ static void test_metal_hc_split_weighted_sum_norm_batch_exact(void) {
         ds4_gpu_tensor_free(fused_out);
         ds4_gpu_tensor_free(ref_norm);
         ds4_gpu_tensor_free(fused_norm);
-        free(model_raw);
+        test_aligned_free(model_raw);
         return;
     }
 
@@ -4353,7 +4374,7 @@ static void test_metal_hc_split_weighted_sum_norm_batch_exact(void) {
     ds4_gpu_tensor_free(fused_out);
     ds4_gpu_tensor_free(ref_norm);
     ds4_gpu_tensor_free(fused_norm);
-    free(model_raw);
+    test_aligned_free(model_raw);
 }
 
 static void test_metal_output_hc_weights4_exact(void) {
@@ -4368,7 +4389,7 @@ static void test_metal_output_hc_weights4_exact(void) {
     char *saved_require = test_save_env(require_env);
 
     void *model_raw = NULL;
-    TEST_ASSERT(posix_memalign(
+    TEST_ASSERT(test_aligned_alloc(
                     &model_raw, (size_t)page, (size_t)model_alloc) == 0);
     ds4_gpu_tensor *pre = ds4_gpu_tensor_alloc(bytes);
     ds4_gpu_tensor *reference = ds4_gpu_tensor_alloc(bytes);
@@ -4488,7 +4509,7 @@ static void test_metal_output_hc_weights4_exact(void) {
     ds4_gpu_tensor_free(candidate);
     ds4_gpu_tensor_free(reference);
     ds4_gpu_tensor_free(pre);
-    free(model_raw);
+    test_aligned_free(model_raw);
 }
 
 static void test_metal_hc_rms_scale_project_f16_exact_shape(
@@ -4511,7 +4532,7 @@ static void test_metal_hc_rms_scale_project_f16_exact_shape(
     const uint64_t scale_bytes = (uint64_t)n_rows * sizeof(float);
 
     void *model_raw = NULL;
-    TEST_ASSERT(posix_memalign(
+    TEST_ASSERT(test_aligned_alloc(
                     &model_raw, (size_t)page, (size_t)model_alloc) == 0);
     ds4_gpu_tensor *x = ds4_gpu_tensor_alloc(x_bytes);
     ds4_gpu_tensor *ref_norm = ds4_gpu_tensor_alloc(x_bytes);
@@ -4701,7 +4722,7 @@ static void test_metal_hc_rms_scale_project_f16_exact_shape(
     ds4_gpu_tensor_free(ref_out);
     ds4_gpu_tensor_free(ref_norm);
     ds4_gpu_tensor_free(x);
-    free(model_raw);
+    test_aligned_free(model_raw);
 }
 
 static void test_metal_hc_rms_scale_project_f16_exact(void) {
@@ -4748,7 +4769,7 @@ static void test_metal_router_simd_finalize_exact(void) {
         "DS4_METAL_DISABLE_ROUTER_SELECT_FUSION";
 
     void *model_raw = NULL;
-    TEST_ASSERT(posix_memalign(&model_raw, (size_t)page, (size_t)page) == 0);
+    TEST_ASSERT(test_aligned_alloc(&model_raw, (size_t)page, (size_t)page) == 0);
     ds4_gpu_tensor *logits = ds4_gpu_tensor_alloc(probs_bytes);
     ds4_gpu_tensor *ref_selected = ds4_gpu_tensor_alloc(selected_bytes);
     ds4_gpu_tensor *simd_selected = ds4_gpu_tensor_alloc(selected_bytes);
@@ -4975,7 +4996,7 @@ static void test_metal_router_simd_finalize_exact(void) {
     ds4_gpu_tensor_free(simd_selected);
     ds4_gpu_tensor_free(ref_selected);
     ds4_gpu_tensor_free(logits);
-    free(model_raw);
+    test_aligned_free(model_raw);
 }
 
 static void test_metal_router_weights_batch_exact(void) {
@@ -5014,7 +5035,7 @@ static void test_metal_router_weights_batch_exact(void) {
         "DS4_METAL_DISABLE_ROUTER_SELECT_FUSION";
 
     void *model_raw = NULL;
-    TEST_ASSERT(posix_memalign(&model_raw, (size_t)page, (size_t)page) == 0);
+    TEST_ASSERT(test_aligned_alloc(&model_raw, (size_t)page, (size_t)page) == 0);
     ds4_gpu_tensor *logits = ds4_gpu_tensor_alloc(logits_bytes);
     ds4_gpu_tensor *tokens = ds4_gpu_tensor_alloc(tokens_bytes);
     ds4_gpu_tensor *ref_selected = ds4_gpu_tensor_alloc(selected_bytes);
@@ -5237,7 +5258,7 @@ static void test_metal_router_weights_batch_exact(void) {
     ds4_gpu_tensor_free(ref_selected);
     ds4_gpu_tensor_free(tokens);
     ds4_gpu_tensor_free(logits);
-    free(model_raw);
+    test_aligned_free(model_raw);
 }
 #endif
 

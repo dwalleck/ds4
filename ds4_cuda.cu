@@ -33,7 +33,11 @@
 #endif
 
 #define CUDA_QK_K 256
+#if defined(_MSC_VER)
+#define DS4_CUDA_UNUSED
+#else
 #define DS4_CUDA_UNUSED __attribute__((unused))
+#endif
 
 enum {
     /* attention_decode_mixed_kernel stores raw-window scores plus visible
@@ -2266,12 +2270,12 @@ static int cuda_model_stage_read_from(int fd, int *direct_fd, uint64_t align,
                                      uint64_t file_size, void *stage, uint64_t stage_bytes,
                                      uint64_t offset, uint64_t bytes, const char **payload) {
     *payload = (const char *)stage;
-#if defined(__linux__) && defined(O_DIRECT)
+#if (defined(__linux__) || defined(_WIN32)) && defined(O_DIRECT)
     if (*direct_fd >= 0 && align > 1 && file_size != 0) {
         const uint64_t aligned_off = cuda_round_down(offset, align);
         const uint64_t delta = offset - aligned_off;
         uint64_t read_size = cuda_round_up(delta + bytes, align);
-        if (aligned_off <= file_size &&
+        if ((uintptr_t)stage % align == 0 && aligned_off <= file_size &&
             read_size <= stage_bytes &&
             read_size <= file_size - aligned_off) {
             const int saved_errno = errno;
@@ -4689,11 +4693,16 @@ extern "C" int ds4_gpu_set_model_fd(int fd) {
             g_model_file_size = (uint64_t)st.st_size;
             if (st.st_blksize > 1) g_model_direct_align = (uint64_t)st.st_blksize;
         }
-#if defined(__linux__) && defined(O_DIRECT)
+#if (defined(__linux__) || defined(_WIN32)) && defined(O_DIRECT)
         if (getenv("DS4_CUDA_NO_DIRECT_IO") == NULL) {
+#ifdef _WIN32
+            /* ReOpenFile retains file identity without Linux procfs paths. */
+            int direct_fd = gufo_reopen(fd, O_RDONLY | O_DIRECT | O_CLOEXEC);
+#else
             char proc_path[64];
             snprintf(proc_path, sizeof(proc_path), "/proc/self/fd/%d", fd);
             int direct_fd = open(proc_path, O_RDONLY | O_DIRECT);
+#endif
             if (direct_fd >= 0) {
                 g_model_direct_fd = direct_fd;
                 if (g_model_direct_align < 512) g_model_direct_align = 512;

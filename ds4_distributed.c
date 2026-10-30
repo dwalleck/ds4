@@ -20,7 +20,9 @@
 #include <float.h>
 #include <math.h>
 #include <netdb.h>
+#ifndef _WIN32
 #include <net/if.h>
+#endif
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 #include <poll.h>
@@ -1295,6 +1297,12 @@ static int dist_bind_connect_interface(int fd, int family, const char *ifname, i
     if (bind_errno) *bind_errno = 0;
     if (!ifname || !ifname[0]) return 0;
 
+#ifdef _WIN32
+    (void)family;
+    errno = ENOTSUP;
+    if (bind_errno) *bind_errno = errno;
+    return -1;
+#else
     unsigned int ifindex = if_nametoindex(ifname);
     if (ifindex == 0) {
         if (bind_errno) *bind_errno = errno ? errno : ENODEV;
@@ -1323,6 +1331,7 @@ static int dist_bind_connect_interface(int fd, int family, const char *ifname, i
         return -1;
     }
     return 0;
+#endif
 }
 
 static int dist_connect_endpoint_once(const char *host, int port, int *last_errno, char *err, size_t errlen) {
@@ -5408,6 +5417,15 @@ int ds4_dist_session_create(
         char *err,
         size_t errlen) {
     (void)owner;
+#ifdef _WIN32
+    (void)engine;
+    (void)opt;
+    (void)ctx_size;
+    if (out) *out = NULL;
+    if (err && errlen) snprintf(err, errlen,
+        "distributed inference is not supported on Windows; use a single-device engine");
+    return 1;
+#endif
     if (!out || !engine || !opt) {
         if (errlen) snprintf(err, errlen, "missing distributed session parameters");
         return 1;
@@ -8305,6 +8323,13 @@ static int dist_validate_options(const ds4_dist_options *opt, char *err, size_t 
         if (errlen) snprintf(err, errlen, "missing distributed options");
         return 1;
     }
+#ifdef _WIN32
+    if (ds4_dist_enabled(opt)) {
+        if (err && errlen) snprintf(err, errlen,
+            "distributed inference is not supported on Windows; use a single-device engine");
+        return 1;
+    }
+#endif
 
     if (opt->role == DS4_DISTRIBUTED_NONE) {
         if (opt->layers.set || opt->listen_host || opt->listen_port ||
@@ -8412,6 +8437,13 @@ static int dist_validate_layers_for_model(const ds4_dist_options *opt, uint32_t 
 }
 
 int ds4_dist_run(ds4_engine *engine, const ds4_dist_options *opt, const ds4_dist_generation_options *gen) {
+#ifdef _WIN32
+    (void)engine;
+    (void)opt;
+    (void)gen;
+    fprintf(stderr, "ds4: distributed inference is not supported on Windows; use a single-device engine\n");
+    return 2;
+#endif
     if (!engine || !opt) {
         fprintf(stderr, "ds4: distributed runtime requires an open engine and options\n");
         return 1;
@@ -8423,7 +8455,9 @@ int ds4_dist_run(ds4_engine *engine, const ds4_dist_options *opt, const ds4_dist
         return 2;
     }
 
+#ifndef _WIN32
     signal(SIGPIPE, SIG_IGN);
+#endif
 
     if (opt->role == DS4_DISTRIBUTED_COORDINATOR) {
         return dist_run_coordinator(engine, opt, gen);

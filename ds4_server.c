@@ -41,7 +41,19 @@
 #include <time.h>
 #include <unistd.h>
 
+#ifdef _WIN32
+#include <windows.h>
+#include <bcrypt.h>
+#include <stdatomic.h>
+#include "gufo_win32_unmacro.h"
+#endif
+
+#ifdef _WIN32
+static _Atomic int g_stop_requested = 0;
+static HANDLE g_shutdown_complete;
+#else
 static volatile sig_atomic_t g_stop_requested = 0;
+#endif
 static volatile sig_atomic_t g_listen_fd = -1;
 
 #define DS4_SERVER_IO_TIMEOUT_SEC 10
@@ -53,6 +65,19 @@ static volatile sig_atomic_t g_listen_fd = -1;
 #define DS4_SERVER_MAYBE_UNUSED
 #endif
 
+#ifdef _WIN32
+static BOOL WINAPI stop_console_handler(DWORD event) {
+    if (event != CTRL_C_EVENT && event != CTRL_BREAK_EVENT &&
+        event != CTRL_CLOSE_EVENT && event != CTRL_SHUTDOWN_EVENT)
+        return FALSE;
+    if (atomic_exchange(&g_stop_requested, 1)) ExitProcess(130);
+    /* Close/shutdown events terminate the process when this callback returns.
+     * Give the normal shutdown path time to persist resident checkpoints. */
+    if (event == CTRL_CLOSE_EVENT || event == CTRL_SHUTDOWN_EVENT)
+        WaitForSingleObject(g_shutdown_complete, INFINITE);
+    return TRUE;
+}
+#else
 static void stop_signal_handler(int sig) {
     (void)sig;
     if (g_stop_requested) _exit(130);
@@ -63,6 +88,7 @@ static void stop_signal_handler(int sig) {
         close(fd);
     }
 }
+#endif
 
 typedef struct {
     char *ptr;
@@ -95,6 +121,17 @@ static char *xstrdup(const char *s) {
 }
 
 static bool random_bytes(void *dst, size_t len) {
+#ifdef _WIN32
+    unsigned char *p = dst;
+    while (len) {
+        ULONG chunk = len > ULONG_MAX ? ULONG_MAX : (ULONG)len;
+        if (BCryptGenRandom(NULL, p, chunk, BCRYPT_USE_SYSTEM_PREFERRED_RNG) < 0)
+            return false;
+        p += chunk;
+        len -= chunk;
+    }
+    return true;
+#else
     unsigned char *p = dst;
     int fd = open("/dev/urandom", O_RDONLY);
     if (fd < 0) return false;
@@ -110,6 +147,7 @@ static bool random_bytes(void *dst, size_t len) {
     }
     close(fd);
     return true;
+#endif
 }
 
 static char *xstrndup(const char *s, size_t n) {
@@ -15379,7 +15417,17 @@ static int listen_on(const char *host, int port) {
     int fd = socket(AF_INET, SOCK_STREAM, 0);
     if (fd < 0) return -1;
     int yes = 1;
+#ifdef _WIN32
+    /* Windows SO_REUSEADDR permits another process to hijack a live listener. */
+    if (setsockopt(fd, SOL_SOCKET, SO_EXCLUSIVEADDRUSE, &yes, sizeof(yes)) != 0) {
+        int saved_errno = errno;
+        close(fd);
+        errno = saved_errno;
+        return -1;
+    }
+#else
     setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(yes));
+#endif
 
     struct sockaddr_in sa;
     memset(&sa, 0, sizeof(sa));
@@ -15844,6 +15892,13 @@ static void server_request_decode_stop(server *s) {
 }
 
 int main(int argc, char **argv) {
+#ifdef _WIN32
+    g_shutdown_complete = CreateEventW(NULL, TRUE, FALSE, NULL);
+    if (!g_shutdown_complete || !SetConsoleCtrlHandler(stop_console_handler, TRUE)) {
+        fprintf(stderr, "ds4-server: failed to install console shutdown handler\n");
+        return 1;
+    }
+#else
     signal(SIGPIPE, SIG_IGN);
     struct sigaction sa;
     memset(&sa, 0, sizeof(sa));
@@ -15851,6 +15906,7 @@ int main(int argc, char **argv) {
     sigemptyset(&sa.sa_mask);
     sigaction(SIGINT, &sa, NULL);
     sigaction(SIGTERM, &sa, NULL);
+#endif
 
     server_config cfg = parse_options(argc, argv);
     if (cfg.chdir_path && chdir(cfg.chdir_path) != 0) {
@@ -16072,6 +16128,20 @@ int main(int argc, char **argv) {
     server_log(DS4_LOG_DEFAULT, "ds4-server: listening on http://%s:%d", cfg.host, cfg.port);
 
     while (!g_stop_requested) {
+#ifdef _WIN32
+        /* Do not close a synthetic descriptor from the console callback: it
+         * could race descriptor reuse. A bounded poll wakes graceful shutdown. */
+        struct pollfd pfd = {.fd = lfd, .events = POLLIN};
+        int ready = poll(&pfd, 1, 100);
+        if (g_stop_requested) break;
+        if (ready == 0 || (ready < 0 && errno == EINTR)) continue;
+        if (ready < 0 || (pfd.revents & (POLLERR | POLLHUP | POLLNVAL))) {
+            server_log(DS4_LOG_DEFAULT, "ds4-server: listener poll failed");
+            g_stop_requested = 1;
+            break;
+        }
+        if (!(pfd.revents & POLLIN)) continue;
+#endif
         int fd = accept(lfd, NULL, NULL);
         if (fd < 0) {
             if (g_stop_requested) break;
@@ -16133,6 +16203,9 @@ int main(int argc, char **argv) {
         kv_cache_store_current(&s, slot, "shutdown");
     }
     server_close_resources(&s);
+#ifdef _WIN32
+    SetEvent(g_shutdown_complete);
+#endif
     return 0;
 }
 #else
@@ -16146,6 +16219,30 @@ static void test_assert(bool cond, const char *file, int line, const char *expr)
 }
 
 #define TEST_ASSERT(expr) test_assert((expr), __FILE__, __LINE__, #expr)
+
+static char *test_mkdtemp(char *path, size_t capacity) {
+#ifdef _WIN32
+    wchar_t temp[PATH_MAX];
+    DWORD n = GetTempPathW((DWORD)(sizeof(temp) / sizeof(temp[0])), temp);
+    if (!n || n >= sizeof(temp) / sizeof(temp[0])) {
+        errno = ENAMETOOLONG;
+        return NULL;
+    }
+    char name[128];
+    const char *base = strrchr(path, '/');
+    snprintf(name, sizeof(name), "%s", base ? base + 1 : path);
+    int bytes = WideCharToMultiByte(CP_UTF8, WC_ERR_INVALID_CHARS, temp, -1,
+                                    path, (int)capacity, NULL, NULL);
+    if (!bytes || (size_t)bytes + strlen(name) > capacity) {
+        errno = ENAMETOOLONG;
+        return NULL;
+    }
+    memcpy(path + bytes - 1, name, strlen(name) + 1);
+#else
+    (void)capacity;
+#endif
+    return mkdtemp(path);
+}
 
 static void test_server_bind_slot(server *s, server_slot *slot) {
     memset(slot, 0, sizeof(*slot));
@@ -21146,6 +21243,40 @@ static void test_client_socket_nonblocking_flag(void) {
     close(sv[1]);
 }
 
+static bool test_client_socket_disconnected(int fd) {
+#ifdef _WIN32
+    /* The Windows socketpair is TCP loopback: a peer close need not have
+     * reached Winsock by the time close() returns in this thread. */
+    long long deadline = wall_ms() + 1000;
+    while (wall_ms() < deadline) {
+        if (client_socket_disconnected(fd)) return true;
+        int remaining = (int)(deadline - wall_ms());
+        if (remaining <= 0) break;
+        struct pollfd pfd = {.fd = fd, .events = POLLIN};
+        if (poll(&pfd, 1, remaining) < 0) return false;
+    }
+#endif
+    return client_socket_disconnected(fd);
+}
+
+#ifdef _WIN32
+static void test_windows_listener_is_exclusive(void) {
+    int fd = listen_on("127.0.0.1", 0);
+    TEST_ASSERT(fd >= 0);
+    if (fd < 0) return;
+    struct sockaddr_in address;
+    socklen_t size = sizeof(address);
+    int rc = getsockname(fd, (struct sockaddr *)&address, &size);
+    TEST_ASSERT(rc == 0);
+    if (rc == 0) {
+        int duplicate = listen_on("127.0.0.1", ntohs(address.sin_port));
+        TEST_ASSERT(duplicate < 0);
+        if (duplicate >= 0) close(duplicate);
+    }
+    close(fd);
+}
+#endif
+
 static void test_client_disconnect_probe(void) {
     int sv[2] = {-1, -1};
     TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
@@ -21154,6 +21285,10 @@ static void test_client_disconnect_probe(void) {
 
     TEST_ASSERT(!client_socket_disconnected(sv[0]));
     TEST_ASSERT(write(sv[1], "x", 1) == 1);
+#ifdef _WIN32
+    struct pollfd pfd = {.fd = sv[0], .events = POLLIN};
+    TEST_ASSERT(poll(&pfd, 1, 1000) > 0);
+#endif
     TEST_ASSERT(!client_socket_disconnected(sv[0]));
     char byte = '\0';
     TEST_ASSERT(recv(sv[0], &byte, 1, 0) < 0);
@@ -21161,7 +21296,7 @@ static void test_client_disconnect_probe(void) {
 
     close(sv[1]);
     sv[1] = -1;
-    TEST_ASSERT(client_socket_disconnected(sv[0]));
+    TEST_ASSERT(test_client_socket_disconnected(sv[0]));
     close(sv[0]);
 
     TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
@@ -21172,7 +21307,7 @@ static void test_client_disconnect_probe(void) {
     TEST_ASSERT(write(sv[1], "extra", 5) == 5);
     close(sv[1]);
     sv[1] = -1;
-    TEST_ASSERT(client_socket_disconnected(sv[0]));
+    TEST_ASSERT(test_client_socket_disconnected(sv[0]));
     close(sv[0]);
 
     TEST_ASSERT(client_poll_revents_disconnected(POLLERR));
@@ -21698,9 +21833,46 @@ static void test_kv_text_stub_file(const char *dir, const char *text,
     test_kv_text_stub_file_model(dir, text, 0, reason, tokens, payload_bytes);
 }
 
+#ifdef _WIN32
+static void test_windows_cache_directory_paths(void) {
+    char tmpl[PATH_MAX] = "/tmp/ds4-kv-windows-paths.XXXXXX";
+    char *root = test_mkdtemp(tmpl, sizeof(tmpl));
+    TEST_ASSERT(root != NULL);
+    if (!root) return;
+    char *parent = path_join(root, "parent");
+    char *nested = path_join(parent, "child");
+    kv_disk_cache kc = {0};
+    TEST_ASSERT(kv_cache_open(&kc, nested, 1, false, kv_cache_default_options()));
+    kv_cache_close(&kc);
+    struct stat st;
+    TEST_ASSERT(stat(nested, &st) == 0 && S_ISDIR(st.st_mode));
+    /* Reopening an existing native path must preserve its contents. */
+    test_kv_text_stub_file(nested, "persisted prefix", KV_REASON_SHUTDOWN, 512, 0);
+    TEST_ASSERT(kv_cache_open(&kc, nested, 1, false, kv_cache_default_options()));
+    TEST_ASSERT(kc.len == 1);
+    kv_cache_close(&kc);
+    char sha[41];
+    sha1_bytes_hex("persisted prefix", strlen("persisted prefix"), sha);
+    char name[44];
+    snprintf(name, sizeof(name), "%.40s.kv", sha);
+    char *checkpoint = path_join(nested, name);
+    char *invalid = path_join(checkpoint, "child");
+    TEST_ASSERT(!kv_cache_open(&kc, invalid, 1, false, kv_cache_default_options()));
+    kv_cache_close(&kc);
+    unlink(checkpoint);
+    rmdir(nested);
+    rmdir(parent);
+    rmdir(root);
+    free(invalid);
+    free(checkpoint);
+    free(nested);
+    free(parent);
+}
+#endif
+
 static void test_kv_cache_lookup_uses_longest_text_prefix(void) {
-    char tmpl[] = "/tmp/ds4-kv-text-prefix-test.XXXXXX";
-    char *dir = mkdtemp(tmpl);
+    char tmpl[PATH_MAX] = "/tmp/ds4-kv-text-prefix-test.XXXXXX";
+    char *dir = test_mkdtemp(tmpl, sizeof(tmpl));
     TEST_ASSERT(dir != NULL);
     if (!dir) return;
 
@@ -21739,8 +21911,8 @@ static void test_kv_cache_lookup_uses_longest_text_prefix(void) {
 }
 
 static void test_kv_cache_lookup_rejects_wrong_model(void) {
-    char tmpl[] = "/tmp/ds4-kv-model-id-test.XXXXXX";
-    char *dir = mkdtemp(tmpl);
+    char tmpl[PATH_MAX] = "/tmp/ds4-kv-model-id-test.XXXXXX";
+    char *dir = test_mkdtemp(tmpl, sizeof(tmpl));
     TEST_ASSERT(dir != NULL);
     if (!dir) return;
 
@@ -21771,8 +21943,8 @@ static void test_kv_cache_lookup_rejects_wrong_model(void) {
 }
 
 static void test_kv_cache_lookup_rejects_stale_payload_abi(void) {
-    char tmpl[] = "/tmp/ds4-kv-stale-abi-test.XXXXXX";
-    char *dir = mkdtemp(tmpl);
+    char tmpl[PATH_MAX] = "/tmp/ds4-kv-stale-abi-test.XXXXXX";
+    char *dir = test_mkdtemp(tmpl, sizeof(tmpl));
     TEST_ASSERT(dir != NULL);
     if (!dir) return;
 
@@ -21872,8 +22044,8 @@ static void test_kv_tool_map_filters_by_dsml_text(void) {
 }
 
 static void test_kv_tool_map_restores_before_prompt_render(void) {
-    char tmpl[] = "/tmp/ds4-kv-tool-map-test.XXXXXX";
-    char *dir = mkdtemp(tmpl);
+    char tmpl[PATH_MAX] = "/tmp/ds4-kv-tool-map-test.XXXXXX";
+    char *dir = test_mkdtemp(tmpl, sizeof(tmpl));
     TEST_ASSERT(dir != NULL);
     if (!dir) return;
 
@@ -21947,8 +22119,8 @@ static void test_kv_tool_map_restores_before_prompt_render(void) {
 }
 
 static void test_kv_cache_eviction_values_fresh_snapshots(void) {
-    char tmpl[] = "/tmp/ds4-kv-evict-test.XXXXXX";
-    char *dir = mkdtemp(tmpl);
+    char tmpl[PATH_MAX] = "/tmp/ds4-kv-evict-test.XXXXXX";
+    char *dir = test_mkdtemp(tmpl, sizeof(tmpl));
     TEST_ASSERT(dir != NULL);
     if (!dir) return;
 
@@ -21983,8 +22155,8 @@ static void test_kv_cache_eviction_values_fresh_snapshots(void) {
 }
 
 static void test_kv_cache_eviction_prefers_anchor_reason(void) {
-    char tmpl[] = "/tmp/ds4-kv-anchor-reason-test.XXXXXX";
-    char *dir = mkdtemp(tmpl);
+    char tmpl[PATH_MAX] = "/tmp/ds4-kv-anchor-reason-test.XXXXXX";
+    char *dir = test_mkdtemp(tmpl, sizeof(tmpl));
     TEST_ASSERT(dir != NULL);
     if (!dir) return;
 
@@ -22019,8 +22191,8 @@ static void test_kv_cache_eviction_prefers_anchor_reason(void) {
 }
 
 static void test_kv_cache_eviction_makes_room_before_store(void) {
-    char tmpl[] = "/tmp/ds4-kv-pre-store-evict-test.XXXXXX";
-    char *dir = mkdtemp(tmpl);
+    char tmpl[PATH_MAX] = "/tmp/ds4-kv-pre-store-evict-test.XXXXXX";
+    char *dir = test_mkdtemp(tmpl, sizeof(tmpl));
     TEST_ASSERT(dir != NULL);
     if (!dir) return;
 
@@ -22048,8 +22220,8 @@ static void test_kv_cache_eviction_makes_room_before_store(void) {
 }
 
 static void test_kv_cache_eviction_ignores_oversize_incoming(void) {
-    char tmpl[] = "/tmp/ds4-kv-oversize-store-evict-test.XXXXXX";
-    char *dir = mkdtemp(tmpl);
+    char tmpl[PATH_MAX] = "/tmp/ds4-kv-oversize-store-evict-test.XXXXXX";
+    char *dir = test_mkdtemp(tmpl, sizeof(tmpl));
     TEST_ASSERT(dir != NULL);
     if (!dir) return;
 
@@ -22077,8 +22249,8 @@ static void test_kv_cache_eviction_ignores_oversize_incoming(void) {
 }
 
 static void test_kv_cache_eviction_prefers_superseded_continued_prefix(void) {
-    char tmpl[] = "/tmp/ds4-kv-prefix-evict-test.XXXXXX";
-    char *dir = mkdtemp(tmpl);
+    char tmpl[PATH_MAX] = "/tmp/ds4-kv-prefix-evict-test.XXXXXX";
+    char *dir = test_mkdtemp(tmpl, sizeof(tmpl));
     TEST_ASSERT(dir != NULL);
     if (!dir) return;
 
@@ -22127,8 +22299,8 @@ static void test_kv_cache_eviction_prefers_superseded_continued_prefix(void) {
 }
 
 static void test_kv_cache_eviction_keeps_smaller_context_prefix(void) {
-    char tmpl[] = "/tmp/ds4-kv-prefix-ctx-test.XXXXXX";
-    char *dir = mkdtemp(tmpl);
+    char tmpl[PATH_MAX] = "/tmp/ds4-kv-prefix-ctx-test.XXXXXX";
+    char *dir = test_mkdtemp(tmpl, sizeof(tmpl));
     TEST_ASSERT(dir != NULL);
     if (!dir) return;
 
@@ -22195,8 +22367,8 @@ static void test_kv_cache_eviction_score_decays_stale_hits(void) {
 }
 
 static void test_kv_cache_eviction_decayed_hits_tie_break_by_age(void) {
-    char tmpl[] = "/tmp/ds4-kv-stale-hit-evict-test.XXXXXX";
-    char *dir = mkdtemp(tmpl);
+    char tmpl[PATH_MAX] = "/tmp/ds4-kv-stale-hit-evict-test.XXXXXX";
+    char *dir = test_mkdtemp(tmpl, sizeof(tmpl));
     TEST_ASSERT(dir != NULL);
     if (!dir) return;
 
@@ -22234,8 +22406,8 @@ static void test_kv_cache_eviction_decayed_hits_tie_break_by_age(void) {
 }
 
 static void test_kv_cache_eviction_keeps_aligned_continued_frontiers(void) {
-    char tmpl[] = "/tmp/ds4-kv-live-prefix-test.XXXXXX";
-    char *dir = mkdtemp(tmpl);
+    char tmpl[PATH_MAX] = "/tmp/ds4-kv-live-prefix-test.XXXXXX";
+    char *dir = test_mkdtemp(tmpl, sizeof(tmpl));
     TEST_ASSERT(dir != NULL);
     if (!dir) return;
 
@@ -22929,6 +23101,10 @@ static void test_deepseek41_live_result_order(void) {
 }
 
 static void ds4_server_unit_tests_run(void) {
+#ifdef _WIN32
+    test_windows_listener_is_exclusive();
+    test_windows_cache_directory_paths();
+#endif
     test_deepseek41_server_stream();
     test_deepseek41_server_tools();
     test_deepseek41_anthropic_results();

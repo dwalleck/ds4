@@ -1,0 +1,29 @@
+musl POSIX fnmatch
+==================
+Upstream: https://git.musl-libc.org/cgit/musl/
+Pinned revision: 7813e9119eb5fe681b6750b8a033a0490bca0941
+Source: https://git.musl-libc.org/cgit/musl/plain/src/regex/fnmatch.c?id=7813e9119eb5fe681b6750b8a033a0490bca0941
+Header: https://git.musl-libc.org/cgit/musl/plain/include/fnmatch.h?id=7813e9119eb5fe681b6750b8a033a0490bca0941
+License: MIT; upstream COPYRIGHT is retained verbatim. The implementation's
+original author/date notice remains in src/regex/fnmatch.c.
+
+Local changes:
+- The public header is installed at compat/win32/include/fnmatch.h.
+- The unused musl-private locale_impl.h include is removed.
+- Conversion uses mbrtowc with a private, reset mbstate_t per character instead
+  of musl's stateless mbtowc, avoiding shared conversion state in UCRT.
+- Bracket conversion uses MB_CUR_MAX rather than a UTF-8-specific limit of 4.
+- Tail boundaries use a forward, character-counted window for multibyte
+  locales instead of UTF-8-specific backward scanning, allowing UCRT code
+  pages as well. The single-byte fast path does not need extra decoding.
+
+The matcher retains POSIX flags=0 behavior: wildcards can cross separators,
+leading dots are ordinary, matching is case-sensitive, and backslash escapes
+pattern characters (it is not treated as a Windows separator in patterns).
+It also retains the upstream FNM_PATHNAME, FNM_NOESCAPE, FNM_PERIOD,
+FNM_LEADING_DIR, and FNM_CASEFOLD flags. Multibyte conversion/classification
+follows the active UCRT locale without changing the process locale.
+
+Compile compat/win32/fnmatch.c, which includes the vendored implementation,
+with /Icompat/win32/include. Do not compile src/regex/fnmatch.c separately.
+No external libraries or generated files are required.

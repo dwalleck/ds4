@@ -22,6 +22,10 @@
 #include <time.h>
 #include <unistd.h>
 
+#ifdef _WIN32
+#include <fcntl.h>
+#endif
+
 #define KV_CACHE_MAGIC0 'K'
 #define KV_CACHE_MAGIC1 'V'
 #define KV_CACHE_MAGIC2 'C'
@@ -340,7 +344,12 @@ bool ds4_kvstore_sha_hex_name(const char *name, char sha[41]) {
 char *ds4_kvstore_path_join(const char *dir, const char *name) {
     kv_buf b = {0};
     kv_buf_puts(&b, dir);
+#ifdef _WIN32
+    if (b.len == 0 || (b.ptr[b.len - 1] != '/' && b.ptr[b.len - 1] != '\\'))
+        kv_buf_putc(&b, '\\');
+#else
     if (b.len == 0 || b.ptr[b.len - 1] != '/') kv_buf_putc(&b, '/');
+#endif
     kv_buf_puts(&b, name);
     return kv_buf_take(&b);
 }
@@ -352,9 +361,72 @@ char *ds4_kvstore_path_for_sha(ds4_kvstore *kc, const char sha[41]) {
     return ds4_kvstore_path_join(kc->dir, name);
 }
 
+#ifdef _WIN32
+static bool kv_path_separator(char c) {
+    return c == '/' || c == '\\';
+}
+
+static bool kv_mkdir_component(const char *path) {
+    if (mkdir(path, 0700) == 0) return true;
+    if (errno != EEXIST) return false;
+    struct stat st;
+    if (stat(path, &st) != 0) return false;
+    if (S_ISDIR(st.st_mode)) return true;
+    errno = ENOTDIR;
+    return false;
+}
+#endif
+
+static int kv_replace_file(const char *from, const char *to) {
+#ifdef _WIN32
+    /* The CRT rename() refuses to replace an existing checkpoint. */
+    return renameat(AT_FDCWD, from, AT_FDCWD, to);
+#else
+    return rename(from, to);
+#endif
+}
+
 static bool kv_mkdir_p(const char *path) {
     if (!path || !path[0]) return false;
     char *tmp = kv_xstrdup(path);
+#ifdef _WIN32
+    char *first = tmp;
+    if (isalpha((unsigned char)tmp[0]) && tmp[1] == ':') {
+        first = tmp + 2;
+    } else if (kv_path_separator(tmp[0]) && kv_path_separator(tmp[1])) {
+        /* UNC roots are existing shares, not directories we can create.
+         * Extended-length drive and UNC prefixes follow the same rule. */
+        first = tmp + 2;
+        if (first[0] == '?' && kv_path_separator(first[1]) &&
+            !_strnicmp(first + 2, "UNC", 3) && kv_path_separator(first[5]))
+            first += 6;
+        else if (first[0] == '?' && kv_path_separator(first[1]) &&
+                 isalpha((unsigned char)first[2]) && first[3] == ':') {
+            first += 4;
+            goto root_ready;
+        }
+        for (int component = 0; component < 2; component++) {
+            while (*first && !kv_path_separator(*first)) first++;
+            if (*first) first++;
+        }
+    }
+root_ready:
+    while (kv_path_separator(*first)) first++;
+    for (char *p = first; *p; p++) {
+        if (!kv_path_separator(*p) || p == first || kv_path_separator(p[-1])) continue;
+        char separator = *p;
+        *p = '\0';
+        bool ok = kv_mkdir_component(tmp);
+        *p = separator;
+        if (!ok) {
+            free(tmp);
+            return false;
+        }
+    }
+    bool ok = kv_mkdir_component(tmp);
+    free(tmp);
+    return ok;
+#else
     for (char *p = tmp + 1; *p; p++) {
         if (*p != '/') continue;
         *p = '\0';
@@ -367,6 +439,7 @@ static bool kv_mkdir_p(const char *path) {
     bool ok = mkdir(tmp, 0700) == 0 || errno == EEXIST;
     free(tmp);
     return ok;
+#endif
 }
 
 void ds4_kvstore_entry_free(ds4_kvstore_entry *e) {
@@ -1095,6 +1168,11 @@ bool ds4_kvstore_store_live_prefix_text(ds4_kvstore *kc,
                                                save_err, sizeof(save_err)) == 0 &&
               kv_trailer_write(hooks, fp, text, &trailer_bytes) &&
               fflush(fp) == 0;
+#ifdef _WIN32
+    /* Publish only a fully flushed checkpoint; the previous file remains
+     * usable if flushing or atomic replacement fails. */
+    if (ok) ok = fsync(fileno(fp)) == 0;
+#endif
     int saved_errno = errno;
     if (fclose(fp) != 0) {
         if (!saved_errno) saved_errno = errno;
@@ -1110,7 +1188,7 @@ bool ds4_kvstore_store_live_prefix_text(ds4_kvstore *kc,
         final_size_over_budget = true;
         ok = false;
     }
-    if (ok && rename(tmp, path) != 0) {
+    if (ok && kv_replace_file(tmp, path) != 0) {
         saved_errno = errno;
         ok = false;
     }

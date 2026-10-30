@@ -103,17 +103,27 @@
  *
  */
 
+#ifndef _WIN32
 #include <termios.h>
+#endif
 #include <unistd.h>
 #include <stdlib.h>
 #include <stdio.h>
 #include <errno.h>
 #include <string.h>
+#include <strings.h>
 #include <stdlib.h>
 #include <ctype.h>
 #include <sys/stat.h>
 #include <sys/types.h>
+#ifndef _WIN32
 #include <sys/ioctl.h>
+#else
+#include <windows.h>
+#include <io.h>
+#include <aclapi.h>
+#include <fcntl.h>
+#endif
 #include <unistd.h>
 #include <stdint.h>
 #include "linenoise.h"
@@ -124,7 +134,62 @@ static struct {
     int fd, depth;
 } terminal_update;
 
+#ifdef _WIN32
+/* CRT descriptors are not HANDLEs, especially on ARM64. Keep native handles
+ * pointer-sized and never close them: the caller owns the descriptors. */
+static HANDLE terminalHandle(int fd) {
+    return (HANDLE)_get_osfhandle(fd);
+}
+
+static int terminalIsTTY(int fd) {
+    DWORD mode;
+    HANDLE h = terminalHandle(fd);
+    return h != INVALID_HANDLE_VALUE && GetConsoleMode(h, &mode);
+}
+#else
+#define terminalIsTTY isatty
+#endif
+
 static int terminalWrite(int fd, const char *text, size_t len) {
+#ifdef _WIN32
+    HANDLE h = terminalHandle(fd);
+    DWORD mode;
+    if (GetConsoleMode(h, &mode)) {
+        UINT cp = GetConsoleOutputCP();
+        DWORD output_mode = mode | ENABLE_PROCESSED_OUTPUT |
+                            ENABLE_VIRTUAL_TERMINAL_PROCESSING;
+        int result = -1;
+        if (cp != CP_UTF8 && !SetConsoleOutputCP(CP_UTF8)) {
+            errno = EIO;
+            return -1;
+        }
+        if (output_mode != mode && !SetConsoleMode(h, output_mode)) {
+            SetConsoleOutputCP(cp);
+            errno = ENOTSUP;
+            return -1;
+        }
+        while (len) {
+            DWORD written, count = len > MAXDWORD ? MAXDWORD : (DWORD)len;
+            if (!WriteFile(h, text, count, &written, NULL) || !written) {
+                errno = EIO;
+                goto console_done;
+            }
+            text += written;
+            len -= written;
+        }
+        result = 0;
+console_done:
+        if (output_mode != mode && !SetConsoleMode(h, mode)) {
+            errno = EIO;
+            result = -1;
+        }
+        if (cp != CP_UTF8 && !SetConsoleOutputCP(cp)) {
+            errno = EIO;
+            result = -1;
+        }
+        return result;
+    }
+#endif
     while (len) {
         ssize_t n = write(fd, text, len);
         if (n < 0 && errno == EINTR) continue;
@@ -191,7 +256,21 @@ static void refreshLineWithCompletion(struct linenoiseState *ls, linenoiseComple
 static void refreshLineWithFlags(struct linenoiseState *l, int flags);
 static void linenoiseFoldClear(struct linenoiseState *l);
 
+#ifndef _WIN32
 static struct termios orig_termios; /* In order to restore at exit.*/
+#else
+static struct {
+    HANDLE input, output;
+    DWORD input_mode, output_mode;
+    UINT input_cp, output_cp;
+    LONG active; /* Published to the Windows console control thread. */
+    char utf8[16];
+    unsigned int utf8_pos, utf8_len;
+    WCHAR high_surrogate;
+    KEY_EVENT_RECORD key;
+    WORD repeats, high_repeats, utf8_repeats;
+} win_console;
+#endif
 static int maskmode = 0; /* Show "***" instead of input. For passwords. */
 static int rawmode = 0; /* For atexit() function to check if restore is needed*/
 static int rawmode_output = STDOUT_FILENO; /* fd used for terminal escapes. */
@@ -601,6 +680,110 @@ static int isUnsupportedTerm(void) {
     return 0;
 }
 
+#ifdef _WIN32
+static DWORD windowsRawInputMode(void) {
+    /* ReadConsoleInputW consumes native key records. VT input pretranslates
+     * those records into byte-sequence events and discards repeat metadata;
+     * enable VT only on output, where the editor actually emits escapes. */
+    return (win_console.input_mode &
+            ~(ENABLE_ECHO_INPUT | ENABLE_LINE_INPUT | ENABLE_PROCESSED_INPUT |
+              ENABLE_QUICK_EDIT_MODE | ENABLE_MOUSE_INPUT | ENABLE_WINDOW_INPUT |
+              ENABLE_VIRTUAL_TERMINAL_INPUT)) |
+           ENABLE_EXTENDED_FLAGS;
+}
+
+static DWORD windowsRawOutputMode(void) {
+    return win_console.output_mode | ENABLE_PROCESSED_OUTPUT |
+           ENABLE_VIRTUAL_TERMINAL_PROCESSING;
+}
+
+/* Also used by the console control thread before Windows terminates us.
+ * Do not use stdio, allocation, or editor callbacks from that thread. */
+static void windowsRestoreConsole(void) {
+    if (!InterlockedCompareExchange(&win_console.active, 0, 0)) return;
+    DWORD written;
+    WriteFile(win_console.output, "\x1b[?2004l", 8, &written, NULL);
+    SetConsoleMode(win_console.input, win_console.input_mode);
+    SetConsoleMode(win_console.output, win_console.output_mode);
+    SetConsoleCP(win_console.input_cp);
+    SetConsoleOutputCP(win_console.output_cp);
+}
+
+static BOOL WINAPI windowsConsoleControl(DWORD event) {
+    switch (event) {
+    case CTRL_C_EVENT:
+    case CTRL_BREAK_EVENT:
+    case CTRL_CLOSE_EVENT:
+    case CTRL_LOGOFF_EVENT:
+    case CTRL_SHUTDOWN_EVENT:
+        windowsRestoreConsole();
+        break;
+    }
+    return FALSE; /* Preserve the application's/default termination policy. */
+}
+
+static int enableRawMode(int fd) {
+    if (rawmode) { errno = EBUSY; return -1; }
+    if (getenv("LINENOISE_ASSUME_TTY")) {
+        rawmode = 1;
+        return 0;
+    }
+    win_console.input = terminalHandle(fd);
+    win_console.output = terminalHandle(rawmode_output);
+    if (!GetConsoleMode(win_console.input, &win_console.input_mode) ||
+        !GetConsoleMode(win_console.output, &win_console.output_mode)) {
+        errno = ENOTTY;
+        return -1;
+    }
+    win_console.input_cp = GetConsoleCP();
+    win_console.output_cp = GetConsoleOutputCP();
+    win_console.utf8_pos = win_console.utf8_len = win_console.repeats = 0;
+    win_console.high_surrogate = 0;
+    win_console.high_repeats = win_console.utf8_repeats = 0;
+    if (!atexit_registered) {
+        if (atexit(linenoiseAtExit)) { errno = ENOMEM; return -1; }
+        atexit_registered = 1;
+    }
+    if (!SetConsoleCtrlHandler(windowsConsoleControl, TRUE)) {
+        errno = EIO;
+        return -1;
+    }
+    InterlockedExchange(&win_console.active, 1);
+    /* Code pages cover readers/writers outside linenoise too. Native input
+     * below decodes UTF-16 directly, independent of the CRT's text mode. */
+    if (!SetConsoleCP(CP_UTF8) || !SetConsoleOutputCP(CP_UTF8) ||
+        !SetConsoleMode(win_console.output, windowsRawOutputMode()) ||
+        !SetConsoleMode(win_console.input, windowsRawInputMode()) ||
+        terminalWrite(rawmode_output, "\x1b[?2004h", 8) < 0) {
+        windowsRestoreConsole();
+        InterlockedExchange(&win_console.active, 0);
+        SetConsoleCtrlHandler(windowsConsoleControl, FALSE);
+        errno = EIO;
+        return -1;
+    }
+    rawmode = 1;
+    return 0;
+}
+
+static void disableRawMode(int fd) {
+    (void)fd;
+    if (!rawmode) return;
+    windowsRestoreConsole();
+    if (win_console.active)
+        SetConsoleCtrlHandler(windowsConsoleControl, FALSE);
+    InterlockedExchange(&win_console.active, 0);
+    rawmode = 0;
+}
+
+void linenoiseRestoreRawMode(void) {
+    if (!win_console.active) return;
+    SetConsoleCP(CP_UTF8);
+    SetConsoleOutputCP(CP_UTF8);
+    SetConsoleMode(win_console.input, windowsRawInputMode());
+    SetConsoleMode(win_console.output, windowsRawOutputMode());
+    terminalWrite(rawmode_output, "\x1b[?2004h", 8);
+}
+#else
 static void linenoiseMakeRawMode(struct termios *raw) {
     raw->c_iflag &= ~(BRKINT | ICRNL | INPCK | ISTRIP | IXON);
     raw->c_oflag &= ~(OPOST);
@@ -685,7 +868,9 @@ void linenoiseRestoreRawMode(void) {
     /* Re-enable bracketed paste mode in case the child disabled it. */
     if (write(rawmode_output, "\x1b[?2004h", 8) == -1) {}
 }
+#endif
 
+#ifndef _WIN32
 /* Use the ESC [6n escape sequence to query the horizontal cursor position
  * and return it. On error -1 is returned, on success the position of the
  * cursor. */
@@ -710,16 +895,26 @@ static int getCursorPosition(int ifd, int ofd) {
     if (sscanf(buf+2,"%d;%d",&rows,&cols) != 2) return -1;
     return cols;
 }
+#endif
 
 /* Try to get the number of columns in the current terminal, or assume 80
  * if it fails. */
 static int getColumns(int ifd, int ofd) {
+#ifndef _WIN32
     struct winsize ws;
+#endif
 
     /* Test mode: use LINENOISE_COLS env var for fixed width. */
     char *cols_env = getenv("LINENOISE_COLS");
     if (cols_env) return atoi(cols_env);
 
+#ifdef _WIN32
+    (void)ifd;
+    CONSOLE_SCREEN_BUFFER_INFO info;
+    if (GetConsoleScreenBufferInfo(terminalHandle(ofd), &info))
+        return info.srWindow.Right - info.srWindow.Left + 1;
+    return 80;
+#else
     if (ioctl(1, TIOCGWINSZ, &ws) == -1 || ws.ws_col == 0) {
         /* ioctl() failed. Try to query the terminal itself. */
         int start, cols;
@@ -748,13 +943,144 @@ static int getColumns(int ifd, int ofd) {
 
 failed:
     return 80;
+#endif
 }
+
+#ifdef _WIN32
+/* ReadConsoleInputW lets the nonblocking editor discard focus, resize and
+ * modifier-only events without accidentally blocking in ReadConsoleW. Keep
+ * repeats and split surrogate pairs until the caller drains their UTF-8. */
+int linenoiseWindowsReadInput(int fd, char *buf, size_t len, int nonblock) {
+    HANDLE h = terminalHandle(fd);
+    DWORD mode;
+    if (!len) return 0;
+    if (len > 0x7fffffff) len = 0x7fffffff;
+    if (!GetConsoleMode(h, &mode)) {
+        if (nonblock && GetFileType(h) == FILE_TYPE_PIPE) {
+            DWORD available;
+            if (!PeekNamedPipe(h, NULL, 0, NULL, &available, NULL)) {
+                DWORD error = GetLastError();
+                if (error == ERROR_BROKEN_PIPE || error == ERROR_PIPE_NOT_CONNECTED)
+                    return 0;
+                errno = EIO;
+                return -1;
+            }
+            if (!available) { errno = EAGAIN; return -1; }
+            if (len > available) len = available;
+        }
+        return (int)read(fd, buf, len);
+    }
+    if (win_console.active && h != win_console.input) {
+        errno = EINVAL;
+        return -1;
+    }
+    size_t used = 0;
+    while (used < len) {
+        while (win_console.utf8_pos < win_console.utf8_len && used < len)
+            buf[used++] = win_console.utf8[win_console.utf8_pos++];
+        if (used == len) break;
+        if (win_console.utf8_len && --win_console.utf8_repeats) {
+            win_console.utf8_pos = 0;
+            continue;
+        }
+        win_console.utf8_pos = win_console.utf8_len = 0;
+        if (!win_console.repeats) {
+            INPUT_RECORD record;
+            DWORD count;
+            if (nonblock || used) {
+                if (!GetNumberOfConsoleInputEvents(h, &count)) {
+                    errno = EIO;
+                    return used ? (int)used : -1;
+                }
+                if (!count) {
+                    if (used) break;
+                    errno = EAGAIN;
+                    return -1;
+                }
+            }
+            if (!ReadConsoleInputW(h, &record, 1, &count)) {
+                errno = GetLastError() == ERROR_OPERATION_ABORTED ? EINTR : EIO;
+                return used ? (int)used : -1;
+            }
+            if (!count || record.EventType != KEY_EVENT) continue;
+            win_console.key = record.Event.KeyEvent;
+            if (!win_console.key.bKeyDown &&
+                !(win_console.key.wVirtualKeyCode == VK_MENU &&
+                  win_console.key.uChar.UnicodeChar)) continue;
+            win_console.repeats = win_console.key.wRepeatCount;
+            if (!win_console.repeats) continue;
+        }
+        WORD repeats = win_console.repeats;
+        win_console.repeats = 0;
+        WCHAR wc = win_console.key.uChar.UnicodeChar;
+        WCHAR wide[2];
+        int wide_len = 1;
+        if (win_console.high_surrogate) {
+            if (wc >= 0xdc00 && wc <= 0xdfff) {
+                wide[0] = win_console.high_surrogate;
+                wide[1] = wc;
+                wide_len = 2;
+                WORD paired = repeats < win_console.high_repeats ?
+                              repeats : win_console.high_repeats;
+                win_console.repeats = repeats - paired;
+                repeats = paired;
+                win_console.high_repeats -= repeats;
+                if (!win_console.high_repeats) win_console.high_surrogate = 0;
+            } else {
+                wide[0] = 0xfffd;
+                win_console.repeats = repeats; /* Defer this key until after U+FFFD. */
+                repeats = win_console.high_repeats;
+                win_console.high_surrogate = 0;
+                win_console.high_repeats = 0;
+            }
+        } else if (wc >= 0xd800 && wc <= 0xdbff) {
+            win_console.high_surrogate = wc;
+            win_console.high_repeats = repeats;
+            continue;
+        } else if (wc) {
+            wide[0] = wc >= 0xdc00 && wc <= 0xdfff ? 0xfffd : wc;
+        } else {
+            const char *seq = NULL;
+            switch (win_console.key.wVirtualKeyCode) {
+            case VK_UP: seq = "\x1b[A"; break;
+            case VK_DOWN: seq = "\x1b[B"; break;
+            case VK_RIGHT: seq = "\x1b[C"; break;
+            case VK_LEFT: seq = "\x1b[D"; break;
+            case VK_HOME: seq = "\x1b[H"; break;
+            case VK_END: seq = "\x1b[F"; break;
+            case VK_DELETE: seq = "\x1b[3~"; break;
+            }
+            if (seq) {
+                win_console.utf8_len = (unsigned int)strlen(seq);
+                memcpy(win_console.utf8, seq, win_console.utf8_len);
+                win_console.utf8_repeats = repeats;
+            }
+            continue;
+        }
+        DWORD controls = win_console.key.dwControlKeyState;
+        unsigned int prefix = (controls & (LEFT_ALT_PRESSED | RIGHT_ALT_PRESSED)) &&
+                              !(controls & (LEFT_CTRL_PRESSED | RIGHT_CTRL_PRESSED));
+        if (prefix) win_console.utf8[0] = '\x1b';
+        int bytes = WideCharToMultiByte(CP_UTF8, 0, wide, wide_len,
+                        win_console.utf8 + prefix,
+                        (int)sizeof(win_console.utf8) - (int)prefix, NULL, NULL);
+        if (!bytes) { errno = EILSEQ; return used ? (int)used : -1; }
+        win_console.utf8_len = prefix + (unsigned int)bytes;
+        win_console.utf8_repeats = repeats;
+    }
+    return (int)used;
+}
+#endif
 
 /* Clear the screen. Used to handle ctrl+l */
 void linenoiseClearScreen(void) {
+#ifdef _WIN32
+    terminalWrite(STDOUT_FILENO, "\x1b[H\x1b[2J", 7);
+#else
     if (write(STDOUT_FILENO,"\x1b[H\x1b[2J",7) <= 0) {
         /* nothing to do, just to avoid warning. */
     }
+#endif
 }
 
 /* Beep, used for completion when there is nothing to complete or when all
@@ -1653,8 +1979,12 @@ static void refreshMultiLine(struct linenoiseState *l, int flags) {
 /* Calls the two low level functions refreshSingleLine() or
  * refreshMultiLine() according to the selected mode. */
 static void refreshLineWithFlags(struct linenoiseState *l, int flags) {
+#ifdef _WIN32
+    l->cols = getColumns(l->ifd, l->ofd);
+#else
     struct winsize ws;
     if (ioctl(l->ofd, TIOCGWINSZ, &ws) == 0 && ws.ws_col) l->cols = ws.ws_col;
+#endif
     linenoiseBeginUpdate(l->ofd);
     if (mlmode || linenoiseStatusActive(l) || l->oldstatusrows)
         refreshMultiLine(l,flags);
@@ -1870,7 +2200,11 @@ static int linenoiseReadByte(struct linenoiseState *l, char *c) {
         }
         return 1;
     }
+#ifdef _WIN32
+    return linenoiseWindowsReadInput(l->ifd, c, 1, 0);
+#else
     return (int)read(l->ifd, c, 1);
+#endif
 }
 
 /* Move cursor on the left. Moves by one UTF-8 character, not byte. */
@@ -2053,7 +2387,7 @@ int linenoiseEditStart(struct linenoiseState *l, int stdin_fd, int stdout_fd, ch
     rawmode_output = l->ofd;
     if (enableRawMode(l->ifd) == -1) return -1;
 
-    l->cols = getColumns(stdin_fd, stdout_fd);
+    l->cols = getColumns(l->ifd, l->ofd);
     l->oldrows = 0;
     l->oldstatusrows = 0;
     l->oldrpos = 1;  /* Cursor starts on row 1. */
@@ -2066,13 +2400,20 @@ int linenoiseEditStart(struct linenoiseState *l, int stdin_fd, int stdout_fd, ch
     /* If stdin is not a tty, stop here with the initialization. We
      * will actually just read a line from standard input in blocking
      * mode later, in linenoiseEditFeed(). */
-    if (!isatty(l->ifd) && !getenv("LINENOISE_ASSUME_TTY")) return 0;
+    if (!terminalIsTTY(l->ifd) && !getenv("LINENOISE_ASSUME_TTY")) return 0;
 
     /* The latest history entry is always our current buffer, that
      * initially is just an empty string. */
     linenoiseHistoryAdd("");
 
-    if (linenoiseWrite(l->ofd,prompt,l->plen) == -1) return -1;
+    if (linenoiseWrite(l->ofd,prompt,l->plen) == -1) {
+#ifdef _WIN32
+        history_len--;
+        free(history[history_len]);
+        disableRawMode(l->ifd);
+#endif
+        return -1;
+    }
     l->oldrows = 1;
     return 0;
 }
@@ -2259,7 +2600,7 @@ char *linenoiseEditMore = "If you see this, you are misusing the API: when linen
 char *linenoiseEditFeed(struct linenoiseState *l) {
     /* Not a TTY, pass control to line reading without character
      * count limits. */
-    if (!isatty(l->ifd) && !getenv("LINENOISE_ASSUME_TTY")) return linenoiseNoTTY();
+    if (!terminalIsTTY(l->ifd) && !getenv("LINENOISE_ASSUME_TTY")) return linenoiseNoTTY();
 
     char c;
     int nread;
@@ -2475,7 +2816,7 @@ char *linenoiseEditFeedByte(struct linenoiseState *l, char c) {
 void linenoiseEditStop(struct linenoiseState *l) {
     int had_status = l->oldstatusrows != 0;
     int had_prompt = l->oldrows != 0 || l->oldstatusrows != 0;
-    if ((isatty(l->ifd) || getenv("LINENOISE_ASSUME_TTY")) && had_status) {
+    if ((terminalIsTTY(l->ifd) || getenv("LINENOISE_ASSUME_TTY")) && had_status) {
         char seq[64];
         int down = (int)(l->oldrows + l->oldstatusrows) - l->oldrpos;
         if (down > 0) {
@@ -2503,7 +2844,7 @@ void linenoiseEditStop(struct linenoiseState *l) {
     l->status_start = NULL;
     l->status_end = NULL;
     l->oldstatusrows = 0;
-    if (!isatty(l->ifd) && !getenv("LINENOISE_ASSUME_TTY")) return;
+    if (!terminalIsTTY(l->ifd) && !getenv("LINENOISE_ASSUME_TTY")) return;
     disableRawMode(l->ifd);
     if (!had_status && had_prompt) printf("\n");
 }
@@ -2552,7 +2893,11 @@ void linenoisePrintKeyCodes(void) {
         char c;
         int nread;
 
+#ifdef _WIN32
+        nread = linenoiseWindowsReadInput(STDIN_FILENO, &c, 1, 0);
+#else
         nread = read(STDIN_FILENO,&c,1);
+#endif
         if (nread <= 0) continue;
         memmove(quit,quit+1,sizeof(quit)-1); /* shift string to left. */
         quit[sizeof(quit)-1] = c; /* Insert current char on the right. */
@@ -2608,12 +2953,79 @@ static char *linenoiseReadLine(FILE *fp, int *err) {
     }
 }
 
+#ifdef _WIN32
+/* With redirected stdout, keep cooked console editing/echo but bypass the
+ * legacy input code page. ReadConsoleW returns one cooked line at a time;
+ * redirected stdin continues to use the ordinary byte-stream reader. */
+static char *windowsConsoleReadLine(HANDLE input) {
+    size_t len = 0, cap = 128;
+    WCHAR *wide = malloc(cap * sizeof(*wide));
+    DWORD mode;
+    if (!wide) return NULL;
+    if (!GetConsoleMode(input, &mode)) {
+        free(wide);
+        errno = ENOTTY;
+        return NULL;
+    }
+    for (;;) {
+        if (len + 1 == cap) {
+            if (cap > 0x7fffffff / 2) {
+                free(wide);
+                errno = ENOMEM;
+                return NULL;
+            }
+            cap *= 2;
+            WCHAR *next = realloc(wide, cap * sizeof(*wide));
+            if (!next) { free(wide); return NULL; }
+            wide = next;
+        }
+        DWORD count, available = (DWORD)(cap - len - 1);
+        if (!(mode & ENABLE_LINE_INPUT)) available = 1;
+        if (!ReadConsoleW(input, wide + len, available, &count, NULL)) {
+            DWORD error = GetLastError();
+            free(wide);
+            errno = error == ERROR_OPERATION_ABORTED ? EINTR : EIO;
+            return NULL;
+        }
+        if (!count) {
+            if (!len) { free(wide); return NULL; }
+            break;
+        }
+        len += count;
+        if (wide[len - 1] == L'\n') break;
+    }
+    if (len && wide[len - 1] == L'\n') len--;
+    if (len && wide[len - 1] == L'\r') len--;
+    if (len && wide[0] == 0x1a) { free(wide); return NULL; }
+    int bytes = len ? WideCharToMultiByte(CP_UTF8, 0, wide, (int)len,
+                                         NULL, 0, NULL, NULL) : 0;
+    if (len && !bytes) { free(wide); errno = EILSEQ; return NULL; }
+    char *line = malloc((size_t)bytes + 1);
+    if (line) {
+        if (bytes && !WideCharToMultiByte(CP_UTF8, 0, wide, (int)len,
+                                          line, bytes, NULL, NULL)) {
+            free(line);
+            line = NULL;
+            errno = EILSEQ;
+        } else {
+            line[bytes] = '\0';
+        }
+    }
+    free(wide);
+    return line;
+}
+#endif
+
 /* This function is called when linenoise() is called with the standard
  * input file descriptor not attached to a TTY. So for example when the
  * program using linenoise is called in pipe or with a file redirected
  * to its standard input. In this case, we want to be able to return the
  * line regardless of its length. */
 static char *linenoiseNoTTY(void) {
+#ifdef _WIN32
+    if (terminalIsTTY(STDIN_FILENO))
+        return windowsConsoleReadLine(terminalHandle(STDIN_FILENO));
+#endif
     return linenoiseReadLine(stdin,NULL);
 }
 
@@ -2623,7 +3035,12 @@ static char *linenoiseNoTTY(void) {
  * editing function or uses a simple line reader so that you will be able
  * to type something even in the most desperate of the conditions. */
 char *linenoise(const char *prompt) {
-    if (!isatty(STDIN_FILENO) && !getenv("LINENOISE_ASSUME_TTY")) {
+#ifdef _WIN32
+    /* Redirected output must remain plain, without editor cursor escapes. */
+    if (!getenv("LINENOISE_ASSUME_TTY") && !terminalIsTTY(STDOUT_FILENO))
+        return linenoiseNoTTY();
+#endif
+    if (!terminalIsTTY(STDIN_FILENO) && !getenv("LINENOISE_ASSUME_TTY")) {
         /* Not a tty: read from file / pipe. In this mode we don't want any
          * limit to the line size, so we call a function to handle that. */
         return linenoiseNoTTY();
@@ -2745,17 +3162,143 @@ int linenoiseHistorySetMaxLen(int len) {
     return 1;
 }
 
+#ifdef _WIN32
+/* Secure before truncating: a CRT chmod/umask cannot express Windows privacy.
+ * Existing files must belong to this user; do not silently secure somebody
+ * else's file or follow a reparse point while changing its security. */
+static FILE *windowsHistoryOpen(const char *filename) {
+    HANDLE token = NULL, file = INVALID_HANDLE_VALUE;
+    WCHAR *path = NULL;
+    PSECURITY_DESCRIPTOR observed = NULL;
+    union {
+        TOKEN_USER user;
+        BYTE storage[sizeof(TOKEN_USER) + SECURITY_MAX_SID_SIZE];
+    } identity;
+    union {
+        DWORD alignment;
+        BYTE storage[sizeof(ACL) + sizeof(ACCESS_ALLOWED_ACE) + SECURITY_MAX_SID_SIZE];
+    } acl_buffer;
+    PACL acl = (PACL)acl_buffer.storage;
+    SECURITY_DESCRIPTOR security;
+    DWORD count, error;
+    FILE *fp = NULL;
+    if (!OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &token)) goto winfail;
+    if (!GetTokenInformation(token, TokenUser, &identity, sizeof(identity), &count))
+        goto winfail;
+    PSID user = identity.user.User.Sid;
+    if (!InitializeAcl(acl, sizeof(acl_buffer), ACL_REVISION) ||
+        !AddAccessAllowedAceEx(acl, ACL_REVISION, 0, FILE_ALL_ACCESS, user) ||
+        !InitializeSecurityDescriptor(&security, SECURITY_DESCRIPTOR_REVISION) ||
+        !SetSecurityDescriptorOwner(&security, user, FALSE) ||
+        !SetSecurityDescriptorDacl(&security, TRUE, acl, FALSE) ||
+        !SetSecurityDescriptorControl(&security, SE_DACL_PROTECTED, SE_DACL_PROTECTED))
+        goto winfail;
+    int chars = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, filename, -1,
+                                   NULL, 0);
+    if (!chars) goto winfail;
+    path = malloc((size_t)chars * sizeof(*path));
+    if (!path) goto cleanup;
+    if (!MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, filename, -1, path, chars))
+        goto winfail;
+    SECURITY_ATTRIBUTES attributes = {sizeof(attributes), &security, FALSE};
+    file = CreateFileW(path, GENERIC_WRITE | READ_CONTROL | WRITE_DAC, 0,
+                       &attributes, OPEN_ALWAYS,
+                       FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OPEN_REPARSE_POINT, NULL);
+    if (file == INVALID_HANDLE_VALUE) goto winfail;
+    BY_HANDLE_FILE_INFORMATION info;
+    if (!GetFileInformationByHandle(file, &info)) goto winfail;
+    if (info.dwFileAttributes & (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT)) {
+        SetLastError(ERROR_ACCESS_DENIED);
+        goto winfail;
+    }
+    PSID owner;
+    error = GetSecurityInfo(file, SE_FILE_OBJECT, OWNER_SECURITY_INFORMATION,
+                            &owner, NULL, NULL, NULL, &observed);
+    if (error) { SetLastError(error); goto winfail; }
+    if (!owner || !EqualSid(owner, user)) {
+        SetLastError(ERROR_ACCESS_DENIED);
+        goto winfail;
+    }
+    LocalFree(observed);
+    observed = NULL;
+    error = SetSecurityInfo(file, SE_FILE_OBJECT,
+                            DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+                            NULL, NULL, acl, NULL);
+    if (error) { SetLastError(error); goto winfail; }
+    /* Filesystems that cannot enforce ACLs must fail before any history bytes
+     * are written, even if a security API accepted the request. */
+    PACL actual;
+    SECURITY_DESCRIPTOR_CONTROL control;
+    DWORD revision;
+    error = GetSecurityInfo(file, SE_FILE_OBJECT, DACL_SECURITY_INFORMATION,
+                            NULL, NULL, &actual, NULL, &observed);
+    if (error) { SetLastError(error); goto winfail; }
+    ACCESS_ALLOWED_ACE *ace;
+    if (!actual || actual->AceCount != 1 ||
+        !GetSecurityDescriptorControl(observed, &control, &revision) ||
+        !(control & SE_DACL_PROTECTED) || !GetAce(actual, 0, (void **)&ace) ||
+        ace->Header.AceType != ACCESS_ALLOWED_ACE_TYPE ||
+        ace->Header.AceFlags != 0 || ace->Mask != FILE_ALL_ACCESS ||
+        !EqualSid(&ace->SidStart, user)) {
+        SetLastError(ERROR_NOT_SUPPORTED);
+        goto winfail;
+    }
+    LARGE_INTEGER start = {0};
+    if (!SetFilePointerEx(file, start, NULL, FILE_BEGIN) || !SetEndOfFile(file))
+        goto winfail;
+    int fd = _open_osfhandle((intptr_t)file, _O_WRONLY | _O_TEXT);
+    if (fd < 0) goto cleanup;
+    file = INVALID_HANDLE_VALUE; /* The CRT now owns it. */
+    fp = _fdopen(fd, "w");
+    if (!fp) {
+        int saved = errno;
+        _close(fd);
+        errno = saved;
+    }
+    goto cleanup;
+winfail:
+    error = GetLastError();
+    switch (error) {
+    case ERROR_NOT_ENOUGH_MEMORY: case ERROR_OUTOFMEMORY: errno = ENOMEM; break;
+    case ERROR_FILE_NOT_FOUND: case ERROR_PATH_NOT_FOUND: errno = ENOENT; break;
+    case ERROR_ACCESS_DENIED: case ERROR_SHARING_VIOLATION:
+    case ERROR_PRIVILEGE_NOT_HELD: errno = EACCES; break;
+    case ERROR_NOT_SUPPORTED: case ERROR_INVALID_FUNCTION: errno = ENOTSUP; break;
+    case ERROR_INVALID_NAME: case ERROR_INVALID_PARAMETER: errno = EINVAL; break;
+    case ERROR_NO_UNICODE_TRANSLATION: errno = EILSEQ; break;
+    default: errno = EIO; break;
+    }
+cleanup:
+    {
+        int saved = errno;
+        if (observed) LocalFree(observed);
+        if (file != INVALID_HANDLE_VALUE) CloseHandle(file);
+        if (token) CloseHandle(token);
+        free(path);
+        errno = saved;
+    }
+    return fp;
+}
+#endif
+
 /* Save the history in the specified file. On success 0 is returned
  * otherwise -1 is returned. */
 int linenoiseHistorySave(const char *filename) {
+#ifndef _WIN32
     mode_t old_umask = umask(S_IXUSR|S_IRWXG|S_IRWXO);
+#endif
     FILE *fp;
     int j;
 
+#ifdef _WIN32
+    fp = windowsHistoryOpen(filename);
+#else
     fp = fopen(filename,"w");
     umask(old_umask);
     if (fp == NULL) return -1;
     fchmod(fileno(fp),S_IRUSR|S_IWUSR);
+#endif
+    if (fp == NULL) return -1;
     for (j = 0; j < history_len; j++) {
         char *p = history[j];
         /* Keep the history file newline-separated: embedded newlines in an
@@ -2766,7 +3309,13 @@ int linenoiseHistorySave(const char *filename) {
         }
         fputc('\n', fp);
     }
+#ifdef _WIN32
+    int failed = ferror(fp);
+    if (fclose(fp) == EOF) failed = 1;
+    if (failed) { errno = EIO; return -1; }
+#else
     fclose(fp);
+#endif
     return 0;
 }
 
