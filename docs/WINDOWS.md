@@ -6,10 +6,10 @@ CLI/server/agent lifecycle checks, and the eval TUI have passed the checks below
 The initial validated model is DeepSeek V4 Flash. Remaining upstream gates and
 unverified backends are recorded in [WINDOWS_PORT_PLAN.md](WINDOWS_PORT_PLAN.md).
 
-Full-model inference is validated for the pinned Flash model below. Native
-Qwen/Engram disk-tail loading and Qwen CUDA kernels are covered separately;
-these checks alone do not establish full-model inference for another model.
-Distributed, RDMA, and multi-GPU Windows execution remain explicitly unavailable.
+Full-model CUDA inference is validated for the pinned DeepSeek V4 Flash and
+Qwen3.8 Flash Next Q2 models below. Engram disk-tail loading has a synthetic
+regression, not a full V4.1 inference qualification. Distributed, RDMA, and
+multi-GPU Windows execution remain explicitly unavailable.
 
 ## Toolchain
 
@@ -127,7 +127,7 @@ python tools/windows/build.py cuda --test test_qwen4_cuda
 build/windows-arm64/cuda/test_qwen4_cuda.exe
 ```
 
-## CUDA correctness and resource checks
+## DeepSeek CUDA correctness and resource checks
 
 Build all frontends with `python tools/windows/build.py cuda`. Add repeatable
 `--test` options to build `ds4_test`, `test_cuda_tokentile`,
@@ -167,7 +167,7 @@ alignment on this machine. `DS4_CUDA_NO_DIRECT_IO=1` selects the buffered
 comparison path; `DS4_CUDA_WEIGHT_CACHE_VERBOSE=1` reports direct activation
 or fallback. All measured direct runs reported activation without fallback.
 
-## Measured streaming sweep
+## DeepSeek SSD-streaming measurements
 
 The same model and byte-faithful story input were run in this order: resident,
 buffered 8 GiB, direct 8 GiB, direct 4 GiB, and direct 8 GiB again. Each run used
@@ -230,7 +230,7 @@ Add `--env DS4_CUDA_NO_DIRECT_IO=1` before `--` for buffered I/O. Omit the
 streaming options for resident execution; watch the small remaining commit/GPU
 headroom. Use a new measurement directory for every run.
 
-## Live frontend acceptance
+## DeepSeek live frontend acceptance
 
 - **Server:** three loopback lifecycles passed nonstreaming chat, complete SSE,
   genuine tool-call/result consumption, active client disconnect/recovery,
@@ -270,7 +270,83 @@ path when discovery is insufficient. The engine itself does not run under MSYS.
 Browser-backed tools discover Chrome, Chromium, or Edge; `DS4_CHROME` selects an
 explicit executable. Browser startup still requires the agent's normal approval.
 
-## Model identity
+## Qwen3.8 Flash Next native validation
+
+The canonical ds4 Q2 model now runs on Windows ARM64/N1X. The existing local
+NVFP4 conversion is not interchangeable: the native loader rejected its
+unsupported GGUF tensor type 40. No NVFP4 kernel support was added.
+
+Validated model:
+
+- Repository: [`antirez/qwen3.8-flash-next-gguf`](https://huggingface.co/antirez/qwen3.8-flash-next-gguf/tree/d600fe1a43d2e1cdcadb85144ce3142f66f9eefe).
+- Revision: `d600fe1a43d2e1cdcadb85144ce3142f66f9eefe`.
+- File: `C:/models/Qwen3.8-Flash-Next-Q2.gguf`.
+- Size: **147,207,127,040 bytes** (137.10 GiB).
+- SHA-256: `b1b93fa69aca5f187b0fb813aca8f3ec1beb5cf8cf0bd38cf041b93e0b6ccac9`,
+  verified with `certutil`; identical to the recorded Linux Q2 reference.
+- Approximately 41.73 GiB of resident main/MTP weights; the original 95.37 GiB
+  BF16 n-gram table stays on SSD. This is not expert streaming:
+  `--ssd-streaming` is not implemented for Qwen.
+
+```powershell
+hf download antirez/qwen3.8-flash-next-gguf Qwen3.8-Flash-Next-Q2.gguf --revision d600fe1a43d2e1cdcadb85144ce3142f66f9eefe --local-dir C:/models --max-workers 2
+$model = "C:/models/Qwen3.8-Flash-Next-Q2.gguf"
+.\build\windows-arm64\cuda\ds4.exe -m $model --cuda --ctx 8192 --prefill-chunk 1024 --nothink
+```
+
+Add `--mtp` for speculative decoding. Real greedy one-shot runs returned `391`
+for `17 * 23`, both normally and with MTP, and returned valid JSON with the
+correct sorted list and sum for `[19, -4, 7, 7, 0]`.
+The existing model-backed n-gram regression passed failed-read recovery in
+prefill/decode/MTP with exact recovered logits, snapshot restoration, mixed
+ordinary/speculative session cycles, rejection, context limits, and arena growth.
+
+The 100-case official short suite completed all 5,696 target tokens. Compared
+with the checked-in September 15 Linux CUDA baseline for the same model hash:
+
+| Run | Average continuation NLL | First-token matches |
+|---|---:|---:|
+| Recorded Linux CUDA | 0.352979973 | 70/100 |
+| Native Windows CUDA | 0.353026566 | 70/100 |
+
+This is a close reference comparison, not bit identity or a fresh Linux run;
+source revisions, compiler and hardware also differ. All score fields were
+finite, all case IDs matched the complete manifest, and every per-case coverage
+denominator matched the baseline. API comparisons cover 5,568 tokens: the
+documented damaged-emoji cases `case_058` and `case_069` lack API coverage but
+remain in NLL scoring. The unmodified strict `validate_scores.py` rejects that
+existing baseline; its failure is retained, not counted as a pass. The existing
+`compare_scores.py` and a complete coverage audit were used without dropping cases.
+
+Resident benchmark, original `speed-bench/promessi_sposi.txt`, context allocation
+8,257, prefill chunk 8,192, 64 teacher-forced decode tokens, MTP off:
+
+| Context frontier | Additional prefill tokens | Prefill tokens/s | Decode tokens/s |
+|---|---:|---:|---:|
+| 1,024 | 1,024 | 504.93 | 24.47 |
+| 8,192 | 7,168 | 600.39 | 23.70 |
+
+Sampled peaks were 50.83 GiB device-wide GPU usage, 49.58 GiB process private
+bytes and 72.93 GiB system commit. Device/system counters include other processes.
+CUDA reported unavailable no-copy host registration (`out of memory`) and
+successfully used its existing resident device-cache path; inference did not OOM.
+These are bounded, warm-cache-affected checks, not an endurance or cold-I/O study.
+
+Additional test targets:
+
+```powershell
+python tools/windows/build.py cuda --test test_qwen4_ngram_state --test score_official
+.\build\windows-arm64\cuda\test_qwen4_ngram_state.exe $model
+```
+
+Exact commands, outputs, samples and comparisons remain under
+`build/windows-results/qwen-{preflight,generate,state,short,bench}`.
+The numerical build is `ad9f0fae9cf12f7d92305fae529c9defde5f3f6b`; its
+[Linux/macOS CPU CI](https://github.com/dwalleck/ds4/actions/runs/41055749003)
+also passed the new disk-tail regression. Qwen vision, Q4/NVFP4 execution,
+contexts beyond 8K, and a Qwen-specific live server/agent session remain untested.
+
+## DeepSeek model identity
 
 Downloaded to `C:/models` from
 [`antirez/deepseek-v4-gguf`](https://huggingface.co/antirez/deepseek-v4-gguf/tree/f71f23d552d664e523b422157b2befbf74040380),
@@ -334,3 +410,8 @@ revision into ignored `build/windows-fixtures`. The extracted story prompt is
 the long-code-audit prompt is 18,851 bytes with SHA-256
 `efae39172d088e3b8da70f408e53eeebe0f5b17fa407a440ed969cd85e4784dd`.
 Both match the raw-blob audit; the working payloads remain untouched.
+
+Qwen scoring used a separate `build/windows-qwen-fixtures` extraction of the
+same original revision: both Qwen Alibaba fixture collections, their recorded
+CUDA baseline tables, and the story inputs. Only the 100-case short collection
+was scored in this Windows run. The original checkout fixtures were not rewritten.
