@@ -2758,6 +2758,33 @@ static void parse_tensors(ds4_model *m, ds4_cursor *c) {
     }
 }
 
+#ifdef _WIN32
+/* Native Windows mappings can only be released as exact, complete views.
+ * Keep the old view alive while mapping the prefix and rebasing its only
+ * borrowed pointers: metadata keys and tensor names. Values and tensor data
+ * use offsets, and the tensor/metadata directory allocations stay in place.
+ * This runs inside model_open, before any consumers can borrow model strings. */
+static void model_remap_prefix(ds4_model *m, uint64_t size,
+                               const char *operation, const char *label) {
+    const uint8_t *old_map = m->map;
+    const uint64_t old_size = m->size;
+    const uint8_t *prefix = mmap(NULL, (size_t)size, PROT_READ, MAP_PRIVATE, m->fd, 0);
+    if (prefix == MAP_FAILED) ds4_die_errno("cannot mmap model prefix", label);
+    for (uint64_t i = 0; i < m->n_kv; i++) {
+        m->kv[i].key.ptr = (const char *)prefix +
+            (m->kv[i].key.ptr - (const char *)old_map);
+    }
+    for (uint64_t i = 0; i < m->n_tensors; i++) {
+        m->tensors[i].name.ptr = (const char *)prefix +
+            (m->tensors[i].name.ptr - (const char *)old_map);
+    }
+    if (munmap((void *)old_map, (size_t)old_size) != 0)
+        ds4_die_errno(operation, label);
+    m->map = prefix;
+    m->size = size;
+}
+#endif
+
 /* Engram is deliberately outside the weight mapping, not merely absent from
  * a residency list. Startup warming and any future weight-view code must not
  * turn its 189 GiB of random-access rows into a resident model allocation. */
@@ -2793,9 +2820,13 @@ static void model_unmap_engram(ds4_model *m) {
     if (page <= 0 || start % (uint64_t)page || resident_end > start ||
         tables[1]->abs_offset < start + tables[0]->bytes)
         ds4_die("V4.1 Engram tables must follow the page-aligned main weights");
+#ifdef _WIN32
+    model_remap_prefix(m, start, "cannot unmap disk-only region", "Engram");
+#else
     if (munmap((void *)(m->map + start), (size_t)(m->size - start)) != 0)
         ds4_die_errno("cannot unmap disk-only region", "Engram");
     m->size = start;
+#endif
 }
 
 /* Like V4.1 Engram, the n-gram table must trail the resident weights. This
@@ -2844,17 +2875,21 @@ static void model_unmap_qwen_ngrams(ds4_model *m, const char *path) {
     (void)posix_fadvise(fd, (off_t)table->abs_offset, (off_t)table->bytes, POSIX_FADV_NOREUSE);
 #endif
 #endif
+#ifdef _WIN32
+    model_remap_prefix(m, table->abs_offset, "cannot unmap disk-only n-grams", path);
+#else
     if (munmap((void *)(m->map + table->abs_offset), (size_t)(m->size - table->abs_offset)))
         ds4_die_errno("cannot unmap disk-only n-grams", path);
     m->size = table->abs_offset;
+#endif
     m->ngram_fd = fd;
     m->ngram_tensor = table;
 }
 
-/* Open and map the GGUF once.  Metal needs a shared mapping for no-copy
- * MTLBuffers; CPU uses a private read-only mapping to avoid Darwin VM stress.
- * Tokenizer-only callers pass prefetch_cpu=false so inspecting tokens never
- * walks the huge tensor payload. */
+/* Open the GGUF and retain its resident-weight mapping. Metal needs a shared
+ * mapping for no-copy MTLBuffers; CPU uses a private read-only mapping to avoid
+ * Darwin VM stress. Tokenizer-only callers pass prefetch_cpu=false so
+ * inspecting tokens never walks the huge tensor payload. */
 static void model_open(ds4_model *m, const char *path, bool metal_mapping,
                        bool prefetch_cpu) {
     memset(m, 0, sizeof(*m));

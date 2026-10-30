@@ -813,7 +813,7 @@ static void test_idx_score_mm(uint32_t T, uint32_t n, uint32_t pos0) {
 
 /* ---- indexer radix select ---- */
 
-#ifdef __APPLE__
+#if defined(__APPLE__) || defined(_WIN32)
 static int cmp_desc_idx(void *ctx, const void *a, const void *b) {
 #else
 static int cmp_desc_idx(const void *a, const void *b, void *ctx) {
@@ -843,7 +843,9 @@ static void test_idx_select(uint32_t T, uint32_t n, uint32_t k, uint32_t visible
     uint64_t bad = 0;
     for (uint32_t t = 0; t < T; t++) {
         for (uint32_t b = 0; b < n; b++) order[b] = (int32_t)b;
-#ifdef __APPLE__
+#ifdef _WIN32
+        qsort_s(order, n, 4, cmp_desc_idx, sc + (uint64_t)t * n);
+#elif defined(__APPLE__)
         qsort_r(order, n, 4, sc + (uint64_t)t * n, cmp_desc_idx);
 #else
         qsort_r(order, n, 4, cmp_desc_idx, sc + (uint64_t)t * n);

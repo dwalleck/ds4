@@ -23,10 +23,18 @@ TESTS = {
     "ds4_test": (["tests/ds4_test.c", "ds4_help.c", "ds4_kvstore.c", "rax.c", "ds4_gpu_args.c"], False),
     "ds4_agent_test": (["tests/ds4_agent_test.c", "ds4_help.c", "ds4_prompt_prefix.c", "ds4_web.c", "ds4_kvstore.c", "linenoise.c", "ds4_gpu_args.c"], False),
     "test_session_state": (["tests/test_session_state.c"], True),
+    "test_qwen4_ngram_state": (["tests/test_qwen4_ngram_state.c"], True),
+    "test_model_disk_tail": (["tests/test_model_disk_tail.c"], True),
+    "score_official": (["gguf-tools/quality-testing/score_official.c", "rax.c", "ds4_gpu_args.c"], False),
     "test_windows_unsupported": (["tests/test_windows_unsupported.c", "ds4_gpu_args.c"], False),
 }
-CUDA_TESTS = ("test_cuda_tokentile", "test_cuda_ssd_cache",
-              "test_cuda_q8_rows", "test_cuda_compressor")
+CUDA_TESTS = {
+    "test_cuda_tokentile": ["tests/test_cuda_tokentile.c"],
+    "test_cuda_ssd_cache": ["tests/test_cuda_ssd_cache.c"],
+    "test_cuda_q8_rows": ["tests/test_cuda_q8_rows.c"],
+    "test_cuda_compressor": ["tests/test_cuda_compressor.c"],
+    "test_qwen4_cuda": ["tests/test_qwen4_kernels.c"],
+}
 
 
 def run(args, env, cwd):
@@ -76,8 +84,11 @@ def main():
     ap.add_argument("--test", choices=(*TESTS, *CUDA_TESTS), action="append",
                     help="Build a test without running model-dependent cases")
     args = ap.parse_args()
-    if args.target != "cuda" and any(t in CUDA_TESTS for t in args.test or ()):
-        ap.error("CUDA numerical tests require the cuda target")
+    if args.target != "cuda" and any(
+            t in CUDA_TESTS or t == "test_qwen4_ngram_state" for t in args.test or ()):
+        ap.error("CUDA numerical and Qwen n-gram state tests require the cuda target")
+    if args.target != "cpu" and "test_model_disk_tail" in (args.test or ()):
+        ap.error("The model disk-tail mapping test requires the cpu target")
     env = environment(args.vs)
     out = args.out.resolve() / args.target
     out.mkdir(parents=True, exist_ok=True)
@@ -194,7 +205,7 @@ def main():
         link(name, [*[compile_source(p) for p in PROGRAMS[name]], *core, *compatibility])
     for name in args.test or []:
         if name in CUDA_TESTS:
-            sources = ["tests/" + name + ".c"]
+            sources = CUDA_TESTS[name]
             test_core = [built["ds4_image.c"], *core[len(CORE):]]
         else:
             sources, includes_engine = TESTS[name]

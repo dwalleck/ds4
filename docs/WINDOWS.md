@@ -6,10 +6,10 @@ CLI/server/agent lifecycle checks, and the eval TUI have passed the checks below
 The initial validated model is DeepSeek V4 Flash. Remaining upstream gates and
 unverified backends are recorded in [WINDOWS_PORT_PLAN.md](WINDOWS_PORT_PLAN.md).
 
-Only the pinned Flash model below has been validated. Configurations that use
-the loader's disk-only Engram/ngram suffix-unmapping paths are not supported:
-the compatibility layer rejects partial `munmap` with `ENOTSUP`. Distributed,
-RDMA, and multi-GPU Windows execution remain explicitly unavailable.
+Full-model inference is validated for the pinned Flash model below. Native
+Qwen/Engram disk-tail loading and Qwen CUDA kernels are covered separately;
+these checks alone do not establish full-model inference for another model.
+Distributed, RDMA, and multi-GPU Windows execution remain explicitly unavailable.
 
 ## Toolchain
 
@@ -108,6 +108,24 @@ tests cover repeated SIGINT, ignore/restore transitions, and shared abort aliase
 Native memory streams operate directly on caller buffers; session serialization
 does not introduce disk-backed snapshot copies. Distributed, tensor-parallel,
 RDMA, and multi-GPU configurations fail explicitly before loading a model.
+
+Windows cannot partially unmap a file view. The model loader now replaces
+Qwen/Engram's initial view with a read-only resident prefix, rebasing its borrowed
+metadata before releasing the original view. N-gram/Engram payloads stay on disk;
+the general compatibility `munmap` still rejects partial releases. A synthetic
+GGUF regression checks metadata, disk rows, mapping extents, and resource cleanup:
+
+```powershell
+python tools/windows/build.py cpu --test test_model_disk_tail
+build/windows-arm64/cpu/test_model_disk_tail.exe
+```
+
+The upstream Qwen CUDA reference kernels also pass on N1X. Build/run them with:
+
+```powershell
+python tools/windows/build.py cuda --test test_qwen4_cuda
+build/windows-arm64/cuda/test_qwen4_cuda.exe
+```
 
 ## CUDA correctness and resource checks
 

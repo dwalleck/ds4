@@ -122,6 +122,12 @@ not blindly imported:
   original address and exact requested length. Partial unmap returns `ENOTSUP`
   without freeing any part of the live mapping. DS4 callers must not assume
   POSIX suffix-unmap support.
+- The model loader handles disk-only Qwen/Engram tails explicitly: map the
+  retained read-only prefix while the old view is still valid, rebase borrowed
+  metadata keys and tensor names, then release the complete old view. Values
+  remain offset-based; no tensor payload is copied and disk-tail descriptors
+  stay valid. The native regression checks page boundaries that are not
+  allocation-granularity boundaries, disk reads, metadata, and view cleanup.
 - Shared writable mappings retain a backing handle for `MS_SYNC` flushes in
   addition to `FlushViewOfFile`; the view survives closing its original fd.
 - `mlock`/`munlock` perform `VirtualLock`/`VirtualUnlock` and propagate errors and

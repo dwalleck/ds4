@@ -29,6 +29,12 @@ jobs:
           ./tests/test_session_state
           ./tests/test_gpu_args
           ./tests/test_prompt_prefix
+      - name: Exercise disk-only model tails
+        run: |
+          cc -O2 -std=c11 -D_GNU_SOURCE -I. -o test_model_disk_tail \
+            tests/test_model_disk_tail.c ds4_image.o ds4_distributed.o \
+            ds4_tp.o ds4_ssd.o ds4_layer_pack.o -pthread -lm
+          ./test_model_disk_tail
       - name: Exercise server and agent without a model
         run: |
           core="ds4_cpu.o ds4_image.o ds4_distributed.o ds4_tp.o ds4_ssd.o ds4_layer_pack.o"
