@@ -1,3 +1,30 @@
+# Line endings are pinned in-tree, not per clone. This is a C project built on
+# Linux and macOS; a Windows checkout with core.autocrlf=true otherwise writes
+# CRLF into sources and produces unreadable whole-file diffs in review.
+* text=auto eol=lf
+
+# Windows-only helper scripts are authored with CRLF on purpose.
+*.ps1 text eol=crlf
+*.cmd text eol=crlf
+*.bat text eol=crlf
+
+# Model and test payloads are scored byte-for-byte: never EOL-normalize them.
+# (These stay diffable, unlike the true binaries below.)
+gguf-tools/quality-testing/data/** -text
+tests/test-vectors/** -text
+*.vec -text
+*.tsv -text
+
+# Real binaries.
+*.gguf binary
+*.safetensors binary
+*.bin binary
+*.npy binary
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.wav binary
+
 # Preserve hosted-model continuation bytes exactly; these fixtures may contain
 # model-generated trailing whitespace that is meaningful to tokenizer scoring.
 gguf-tools/quality-testing/data/*/continuations/*.txt -diff
