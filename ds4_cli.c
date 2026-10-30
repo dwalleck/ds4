@@ -5,6 +5,9 @@
 #include "ds4_help.h"
 #include "ds4_prompt_prefix.h"
 #include "linenoise.h"
+#ifdef _WIN32
+#include "compat/win32/platform.h"
+#endif
 
 /* ds4 CLI.
  *
@@ -2258,6 +2261,12 @@ static cli_config parse_options(int argc, char **argv) {
 }
 
 int main(int argc, char **argv) {
+#ifdef _WIN32
+    if (ds4_win32_console_init()) {
+        perror("ds4: console initialization");
+        return 1;
+    }
+#endif
     cli_config cfg = parse_options(argc, argv);
     if (cfg.gen.dump_tokens) {
         if (cfg.gen.prefix.count != 0) {

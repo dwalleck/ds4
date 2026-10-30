@@ -11,6 +11,7 @@
 #include <string.h>
 #include <wchar.h>
 #include "../linenoise.h"
+#include "../compat/win32/platform.h"
 
 static HANDLE diagnostic_output;
 
@@ -170,6 +171,58 @@ static int history_test(void) {
     CHECK(count == 3 && !memcmp(content, "x\r\n", 3));
     CHECK(CloseHandle(file));
     CHECK(DeleteFileW(path));
+    return 0;
+}
+
+static int frontend_output_child(void) {
+    FILE *stream;
+    CHECK(_wfreopen_s(&stream, L"CONOUT$", L"w", stdout) == 0);
+    CHECK(SetStdHandle(STD_OUTPUT_HANDLE, (HANDLE)_get_osfhandle(_fileno(stdout))));
+    CHECK(ds4_win32_console_init() == 0);
+    /* No explicit flush: atexit must flush before restoring the legacy CP. */
+    printf("\x1b[H\x1b[32m\xce\xbb!\x1b[0m");
+    return 0;
+}
+
+static int frontend_output_test(void) {
+    HANDLE output = (HANDLE)_get_osfhandle(_fileno(stdout));
+    DWORD original_mode, code, count;
+    UINT original_cp = GetConsoleOutputCP();
+    CHECK(GetConsoleMode(output, &original_mode));
+    const DWORD legacy_mode = ENABLE_PROCESSED_OUTPUT | ENABLE_WRAP_AT_EOL_OUTPUT;
+    CHECK(SetConsoleMode(output, legacy_mode) && SetConsoleOutputCP(437));
+    WCHAR executable[MAX_PATH], command[MAX_PATH + 32];
+    CHECK(GetModuleFileNameW(NULL, executable, MAX_PATH));
+    CHECK(swprintf(command, sizeof(command) / sizeof(command[0]),
+                   L"\"%ls\" --frontend-output", executable) > 0);
+    STARTUPINFOW startup = {0};
+    PROCESS_INFORMATION process;
+    startup.cb = sizeof(startup);
+    CHECK(CreateProcessW(executable, command, NULL, NULL, FALSE, 0,
+                         NULL, NULL, &startup, &process));
+    DWORD wait = WaitForSingleObject(process.hProcess, 10000);
+    if (wait != WAIT_OBJECT_0) {
+        TerminateProcess(process.hProcess, 1);
+        WaitForSingleObject(process.hProcess, 10000);
+    }
+    CHECK(GetExitCodeProcess(process.hProcess, &code));
+    CloseHandle(process.hThread);
+    CloseHandle(process.hProcess);
+    CHECK(wait == WAIT_OBJECT_0 && code == 0);
+    DWORD restored;
+    CHECK(GetConsoleMode(output, &restored) && restored == legacy_mode);
+    CHECK(GetConsoleOutputCP() == 437);
+    CONSOLE_SCREEN_BUFFER_INFO info;
+    CHECK(GetConsoleScreenBufferInfo(output, &info));
+    COORD home = {info.srWindow.Left, info.srWindow.Top};
+    WCHAR visible[2];
+    WORD attributes[2];
+    CHECK(ReadConsoleOutputCharacterW(output, visible, 2, home, &count) && count == 2);
+    CHECK(visible[0] == 0x03bb && visible[1] == L'!');
+    CHECK(ReadConsoleOutputAttribute(output, attributes, 2, home, &count) && count == 2);
+    CHECK((attributes[0] & (FOREGROUND_RED | FOREGROUND_GREEN | FOREGROUND_BLUE)) ==
+          FOREGROUND_GREEN);
+    CHECK(SetConsoleMode(output, original_mode) && SetConsoleOutputCP(original_cp));
     return 0;
 }
 
@@ -333,12 +386,16 @@ static int console_test(void) {
     CHECK(CloseHandle(sink_reader));
     CHECK(GetConsoleMode(ih, &mode) && mode == input_mode);
     CHECK(GetConsoleMode(oh, &mode) && mode == output_mode);
+    int frontend_error = frontend_output_test();
+    if (frontend_error) return frontend_error;
     int history_error = history_test();
     if (history_error) return history_error;
     return redirected_console_test();
 }
 
 int main(int argc, char **argv) {
+    if (argc == 2 && !strcmp(argv[1], "--frontend-output"))
+        return frontend_output_child();
     if (argc == 3 && !strcmp(argv[1], "--console-child")) {
         diagnostic_output = (HANDLE)(uintptr_t)_strtoui64(argv[2], NULL, 10);
         /* Inherited diagnostic pipe must not make the CRT use the parent's

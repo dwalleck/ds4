@@ -18,7 +18,7 @@ jobs:
     runs-on: ${{ matrix.os }}
     timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Build existing CPU targets
         run: make -j2 cpu tests/test_session_state tests/test_gpu_args tests/test_prompt_prefix
       - name: Exercise CPU frontends and serialization

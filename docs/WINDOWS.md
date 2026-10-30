@@ -1,9 +1,15 @@
 # Native Windows ARM64 development
 
 Experimental native Windows ARM64 support is developed on `windows-dev`.
-CPU frontends, native CUDA inference, and SSD streaming have passed the checks
-below. Live frontend lifecycle and longer soak checks remain separate gates in
-[WINDOWS_PORT_PLAN.md](WINDOWS_PORT_PLAN.md).
+All five CPU/CUDA frontends build. Native inference, bounded SSD streaming,
+CLI/server/agent lifecycle checks, and the eval TUI have passed the checks below.
+The initial validated model is DeepSeek V4 Flash. Remaining upstream gates and
+unverified backends are recorded in [WINDOWS_PORT_PLAN.md](WINDOWS_PORT_PLAN.md).
+
+Only the pinned Flash model below has been validated. Configurations that use
+the loader's disk-only Engram/ngram suffix-unmapping paths are not supported:
+the compatibility layer rejects partial `munmap` with `ENOTSUP`. Distributed,
+RDMA, and multi-GPU Windows execution remain explicitly unavailable.
 
 ## Toolchain
 
@@ -25,6 +31,13 @@ No elevated installation, machine-wide PATH change, driver update, reboot,
 pagefile change, or GPU reservation change was needed. The Python build entry
 initializes `vcvarsall.bat arm64` in a child process and verifies executable
 architecture after linking. Existing Unix Makefile targets are unchanged.
+
+The CPU, CUDA, and compatibility targets embed
+`tools/windows/ds4.manifest`, selecting the process UTF-8 active code page.
+Without it, the UCRT narrowed Unicode command-line arguments through system
+ACP 1252 before `main`, turning an existing lambda-named directory into `?`.
+The manifest preserves UTF-8 argv/environment without changing the machine
+locale. Native spawned-child regressions include BMP and supplementary Unicode.
 
 Install the official portable LLVM archive under `%LOCALAPPDATA%/ds4-tools`,
 or pass its compiler path through `--clang`. The validated archive is:
@@ -82,6 +95,16 @@ Console tests passed Unicode editing, repeated surrogate pairs, resize,
 viewport-relative ANSI output, redirected cooked Unicode input, private history
 ACLs, and mode/code-page restoration.
 
+Frontend startup establishes UTF-8/VT output for the whole process, not only
+while linenoise is reading a prompt. This fixes garbled Unicode diagnostics and
+literal ANSI escapes on a CP437/VT-disabled console. Normal exit flushes buffered
+output before restoring console settings; handled cancellation keeps the live
+console configured. Redirected byte streams remain unchanged.
+
+The compatibility `sigaction` adapter preserves process-wide handlers across
+repeated delivery; raw UCRT `signal` handlers are otherwise one-shot. Regression
+tests cover repeated SIGINT, ignore/restore transitions, and shared abort aliases.
+
 Native memory streams operate directly on caller buffers; session serialization
 does not introduce disk-backed snapshot copies. Distributed, tensor-parallel,
 RDMA, and multi-GPU configurations fail explicitly before loading a model.
@@ -124,7 +147,110 @@ Direct streaming reopens the existing native file handle with aligned
 unbuffered I/O instead of using `/proc/self/fd`. Staging uses 4,096-byte
 alignment on this machine. `DS4_CUDA_NO_DIRECT_IO=1` selects the buffered
 comparison path; `DS4_CUDA_WEIGHT_CACHE_VERBOSE=1` reports direct activation
-or fallback. The short direct run reported activation without fallback.
+or fallback. All measured direct runs reported activation without fallback.
+
+## Measured streaming sweep
+
+The same model and byte-faithful story input were run in this order: resident,
+buffered 8 GiB, direct 8 GiB, direct 4 GiB, and direct 8 GiB again. Each run used
+`--ctx-start 128 --ctx-max 2048 --step-mul 4 --ctx-alloc 2065`,
+`--prefill-chunk 128 --gen-tokens 16 --teacher-forced-decode`.
+Verbose cache logging was enabled throughout. Cache sizes below are expert-cache
+targets, not total GPU budgets. No administrative cache purge was performed;
+fixed run order and warm-cache effects prevent treating this as a cold-I/O study.
+
+| Mode | Frontier tokens | Prefill tokens/s | Decode tokens/s |
+|---|---:|---:|---:|
+| Resident | 128 | 27.99 | 17.94 |
+| Resident | 512 | 182.47 | 18.61 |
+| Resident | 2048 | 164.72 | 17.85 |
+| Buffered 8 GiB | 128 | 5.64 | 2.09 |
+| Buffered 8 GiB | 512 | 6.36 | 2.18 |
+| Buffered 8 GiB | 2048 | 5.66 | 1.59 |
+| Direct 8 GiB | 128 | 8.71 | 2.38 |
+| Direct 8 GiB | 512 | 9.96 | 2.37 |
+| Direct 8 GiB | 2048 | 9.81 | 1.85 |
+| Direct 4 GiB | 128 | 9.03 | 1.49 |
+| Direct 4 GiB | 512 | 11.42 | 1.45 |
+| Direct 4 GiB | 2048 | 10.54 | 1.49 |
+| Direct 8 GiB repeat | 128 | 9.08 | 2.38 |
+| Direct 8 GiB repeat | 512 | 10.25 | 2.48 |
+| Direct 8 GiB repeat | 2048 | 10.11 | 1.89 |
+
+Memory peaks are sampled once per second. Logical reads belong to the process;
+GPU/commit counters and physical disk read rates include other processes.
+
+| Mode | Wall seconds | Private GiB | System commit GiB | GPU GiB | Logical reads GiB | Peak physical reads GiB/s |
+|---|---:|---:|---:|---:|---:|---:|
+| Resident | 50.21 | 97.72 | 120.85 | 95.81 | 87.48 | 6.44 |
+| Buffered 8 GiB | 382.33 | 20.39 | 43.34 | 21.46 | 793.70 | 2.52 |
+| Direct 8 GiB | 237.24 | 20.39 | 43.36 | 21.46 | 794.44 | 3.98 |
+| Direct 4 GiB | 229.23 | 17.35 | 40.48 | 18.43 | 826.61 | 4.20 |
+| Direct 8 GiB repeat | 228.22 | 20.39 | 43.73 | 21.47 | 794.44 | 4.14 |
+
+The 4 GiB case deliberately exercised the cache-pressure warning: 94 dynamic
+expert slots versus a 258-expert per-token routed working set. Its lower decode
+rate is not a reason to prefer that budget. The 128-token chunk is deliberately
+small; these figures are not a claim of maximum achievable prefill throughput.
+
+All 129,280 logits were finite at every frontier. Buffered/direct, 4/8 GiB,
+and repeated streaming runs had exactly equal serialized logit values.
+Against resident execution, every comparison retained the same top-1 and
+top-5/top-20 sets; worst full-vocabulary absolute difference was 0.0136547.
+No upstream tolerance was loosened.
+
+Raw CSV stdout, stderr, samples, summaries, and frontier logits remain under
+ignored `build/windows-results/benchmark-*` and `benchmark-logits`.
+The benchmark uses the numerical implementation published at `410d90b`.
+Reproduce a direct-streaming run after setting `DS4_TEST_MODEL`:
+
+```powershell
+python tools/windows/measure.py --out build/windows-results/new-direct-run --env DS4_CUDA_WEIGHT_CACHE_VERBOSE=1 -- build/windows-arm64/cuda/ds4-bench.exe -m $env:DS4_TEST_MODEL --cuda --prompt-file build/windows-fixtures/tests/long_context_story_prompt.txt --ctx-start 128 --ctx-max 2048 --step-mul 4 --ctx-alloc 2065 --prefill-chunk 128 --gen-tokens 16 --teacher-forced-decode --ssd-streaming --ssd-streaming-cache-experts 8GB
+```
+
+Add `--env DS4_CUDA_NO_DIRECT_IO=1` before `--` for buffered I/O. Omit the
+streaming options for resident execution; watch the small remaining commit/GPU
+headroom. Use a new measurement directory for every run.
+
+## Live frontend acceptance
+
+- **Server:** three loopback lifecycles passed nonstreaming chat, complete SSE,
+  genuine tool-call/result consumption, active client disconnect/recovery,
+  and concurrent engine-lock refusal. Native CtrlBreak drained and exited zero
+  each time. Unicode/space KV directories persisted shutdown checkpoints;
+  both restarts loaded those files, incremented their hit counters, reported
+  215 cached tokens, and recalled the stored conversation fact.
+- **CLI:** two fresh real-console runs edited and generated `café 中雪`
+  identically with greedy sampling/seed 1337, exercised Unicode history,
+  exited normally, and restored the original CP437/VT-disabled modes.
+- **Eval:** the real split TUI rendered its paused score/case panels, accepted
+  Down/Up selection and `q`, and restored the original screen and console modes.
+- **Agent:** a real model-driven read/write/bash loop ran in a lambda-named
+  working directory, copied a randomized 38-byte file exactly, passed shell
+  `cmp`, emitted the shell success marker, and returned `DONE`.
+- **Browser:** Edge `156.0.4314.50` passed both automatic discovery and the
+  `DS4_CHROME` override. Native CDP extracted a randomized local-page marker,
+  reused the session after freeing the web handle, and kept the browser alive
+  after the caller exited. Both isolated Unicode-path profiles were closed
+  through CDP; personal profiles and unrelated browsers were not used.
+
+Model-backed live checks used 8 GiB streaming caches. CLI/eval used context 1024; server used
+2048; the agent used 8192 with prefill chunk 2048. These are bounded lifecycle
+and repeatability checks, not a 24-hour endurance certification. Evidence remains
+under `build/windows-results/{server-live,terminal-live-bmp,eval-live-calibrated,agent-live}`.
+Browser reports are in `build/windows-results/browser-live` and
+`build/windows-results/browser-live-auto`; those checks require no model/GPU.
+
+Legacy console capture has two observed limits on this host: supplementary
+glyphs become replacement characters even in a direct Win32 write/read probe,
+and `GetConsoleCursorInfo` does not reflect VT cursor-hide requests. Visual
+checks therefore used BMP Unicode; supplementary input/argv bytes are covered
+by native regressions. Neither capture limitation was patched around in ds4.
+
+Git Bash supplies the agent's external `bash` tool; set `DS4_SHELL` to its full
+path when discovery is insufficient. The engine itself does not run under MSYS.
+Browser-backed tools discover Chrome, Chromium, or Edge; `DS4_CHROME` selects an
+explicit executable. Browser startup still requires the agent's normal approval.
 
 ## Model identity
 
@@ -148,6 +274,13 @@ Windows plan appeared in initial status. Remotes:
 
 - `origin`: <https://github.com/antirez/ds4.git> (do not push here).
 - `fork`: <https://github.com/dwalleck/ds4.git> (development publication target).
+
+The first tested native milestone, `410d90bc9bd3f73003c1ce3657595d6a86c50260`,
+is published to `fork/windows-dev`. Its
+[Linux/macOS CI run](https://github.com/dwalleck/ds4/actions/runs/41011420079)
+passed the existing CPU builds, all frontend help paths, session serialization,
+GPU-argument/prompt-prefix regressions, and model-independent server/agent tests.
+These are CPU/host checks, not fresh Linux CUDA or macOS Metal inference runs.
 
 The user explicitly approved the temporary vendored C++ compatibility exception
 and user-local tool acquisition, with CUDA installation permitted if necessary.

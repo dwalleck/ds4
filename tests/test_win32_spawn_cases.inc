@@ -19,7 +19,8 @@
 
 static const char *const spawn_quote_arguments[] = {
     "", "two words", "tab\there", "line\nbreak", "literal\"quote",
-    "\\", "trailing \\", "before\\\\\"after", "\\\\server\\share\\", NULL};
+    "\\", "trailing \\", "before\\\\\"after", "\\\\server\\share\\",
+    "\xce\xbb\xe9\x9b\xaa \xf0\x90\x90\x80", NULL};
 
 int win32_spawn_child(int argc, char **argv) {
     if (argc < 3 || strcmp(argv[1], "--win32-spawn-child") != 0) return -1;

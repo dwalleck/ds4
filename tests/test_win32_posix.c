@@ -366,9 +366,41 @@ static void test_change_directory(void) {
     assert(unlink(marker) == 0 && rmdir(directory) == 0 && rmdir(base) == 0);
 }
 
+static volatile sig_atomic_t interrupt_count;
+
+static void count_interrupt(int signal_number) {
+    if (signal_number == SIGINT || signal_number == SIGABRT ||
+        signal_number == SIGABRT_COMPAT) ++interrupt_count;
+}
+
+static void test_persistent_signal_action(void) {
+    struct sigaction action = {0}, original, previous;
+    action.sa_handler = count_interrupt;
+    assert(sigaction(SIGINT, &action, &original) == 0);
+    interrupt_count = 0;
+    assert(raise(SIGINT) == 0 && interrupt_count == 1);
+    assert(raise(SIGINT) == 0 && interrupt_count == 2);
+    action.sa_handler = SIG_IGN;
+    assert(sigaction(SIGINT, &action, &previous) == 0);
+    assert(previous.sa_handler == count_interrupt);
+    assert(raise(SIGINT) == 0 && interrupt_count == 2);
+    assert(sigaction(SIGINT, &original, &previous) == 0);
+    assert(previous.sa_handler == SIG_IGN);
+    /* UCRT shares one action between its legacy and modern abort numbers,
+     * but raise preserves the delivered number. Both must stay persistent. */
+    action.sa_handler = count_interrupt;
+    assert(sigaction(SIGABRT_COMPAT, &action, &original) == 0);
+    interrupt_count = 0;
+    assert(raise(SIGABRT) == 0 && interrupt_count == 1);
+    assert(raise(SIGABRT_COMPAT) == 0 && interrupt_count == 2);
+    assert(sigaction(SIGABRT_COMPAT, &original, &previous) == 0);
+    assert(previous.sa_handler == count_interrupt);
+}
+
 int main(int argc, char **argv) {
     int child = win32_spawn_child(argc, argv);
     if (child >= 0) return child;
+    test_persistent_signal_action();
     test_positioned_io();
     test_mappings();
     test_descriptors_and_locks();

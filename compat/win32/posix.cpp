@@ -1976,6 +1976,27 @@ int kill(pid_t pid, int sig) {
   return 0;
 }
 
+typedef void (*Win32SignalHandler)(int);
+static SRWLOCK signal_action_lock = SRWLOCK_INIT;
+static Win32SignalHandler signal_actions[NSIG] = {};
+
+static void DeliverPersistentSignal(int sig) {
+  AcquireSRWLockExclusive(&signal_action_lock);
+  const Win32SignalHandler handler =
+      signal_actions[sig == SIGABRT_COMPAT ? SIGABRT : sig];
+  /* UCRT clears a custom signal() action before invoking it. Serialize
+   * rearming with sigaction changes so cancellation remains persistent and
+   * cannot overwrite a concurrently installed ignore/default disposition. */
+  if (handler != SIG_DFL && handler != SIG_IGN)
+    signal(sig, DeliverPersistentSignal);
+  ReleaseSRWLockExclusive(&signal_action_lock);
+  if (handler == SIG_DFL) {
+    raise(sig);
+  } else if (handler != SIG_IGN) {
+    handler(sig);
+  }
+}
+
 int sigaction(int sig, const struct sigaction* action,
               struct sigaction* previous) {
   if (previous != nullptr) {
@@ -1991,14 +2012,26 @@ int sigaction(int sig, const struct sigaction* action,
       sig == SIGHUP || sig == SIGCHLD || sig == SIGUSR1) {
     errno = ENOTSUP; return -1;
   }
-  void (*handler)(int) = action->sa_handler;
-  const auto old = signal(sig, handler);
+  if (sig == SIGABRT_COMPAT) sig = SIGABRT;
+  /* These CRT actions are process-wide. Hardware exception actions are
+   * thread-local in UCRT and cannot provide the POSIX sigaction contract. */
+  if (sig != SIGINT && sig != SIGBREAK && sig != SIGTERM && sig != SIGABRT) {
+    errno = ENOTSUP; return -1;
+  }
+  const Win32SignalHandler handler = action->sa_handler;
+  const Win32SignalHandler native_handler =
+      handler == SIG_DFL || handler == SIG_IGN ? handler : DeliverPersistentSignal;
+  AcquireSRWLockExclusive(&signal_action_lock);
+  const Win32SignalHandler old_handler = signal_actions[sig];
+  const auto old = signal(sig, native_handler);
+  if (old != SIG_ERR) signal_actions[sig] = handler;
+  ReleaseSRWLockExclusive(&signal_action_lock);
   if (old == SIG_ERR) {
     errno = EINVAL;
     return -1;
   }
   if (previous != nullptr) {
-    previous->sa_handler = old;
+    previous->sa_handler = old == DeliverPersistentSignal ? old_handler : old;
   }
   return 0;
 }

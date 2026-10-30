@@ -6,6 +6,9 @@
 #include "ds4_kvstore.h"
 #include "ds4_tp.h"
 #include "rax.h"
+#ifdef _WIN32
+#include "compat/win32/platform.h"
+#endif
 
 /* OpenAI/Anthropic compatible local server.
  *
@@ -15893,6 +15896,10 @@ static void server_request_decode_stop(server *s) {
 
 int main(int argc, char **argv) {
 #ifdef _WIN32
+    if (ds4_win32_console_init()) {
+        perror("ds4-server: console initialization");
+        return 1;
+    }
     g_shutdown_complete = CreateEventW(NULL, TRUE, FALSE, NULL);
     if (!g_shutdown_complete || !SetConsoleCtrlHandler(stop_console_handler, TRUE)) {
         fprintf(stderr, "ds4-server: failed to install console shutdown handler\n");

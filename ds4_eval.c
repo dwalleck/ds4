@@ -35,6 +35,7 @@
 #include <windows.h>
 #include <io.h>
 #include "linenoise.h"
+#include "compat/win32/platform.h"
 #else
 #include <sys/ioctl.h>
 #include <termios.h>
@@ -4806,6 +4807,12 @@ static void list_eval_cases(const eval_case *cases, int ncases) {
 }
 
 int main(int argc, char **argv) {
+#ifdef _WIN32
+    if (ds4_win32_console_init()) {
+        perror("ds4-eval: console initialization");
+        return 1;
+    }
+#endif
     eval_config cfg = parse_options(argc, argv);
     if (cfg.self_test_extractors) return run_extractor_self_tests();
     if (cfg.validate_cases) return validate_eval_cases(true);

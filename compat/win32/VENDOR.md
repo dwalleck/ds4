@@ -178,6 +178,12 @@ not blindly imported:
   Windows CRT first-token parser and return EINVAL. ARM64 CRT inheritance allows
   descriptor numbers below 7281 before accounting for the flags trailer; the
   complete block must fit 65535 bytes, otherwise spawn explicitly returns E2BIG.
+- `sigaction` maintains process-wide persistent handlers for SIGINT, SIGBREAK,
+  SIGTERM, and SIGABRT, including the legacy CRT abort alias. The dispatcher
+  rearms the UCRT's one-shot handler before invoking user code; registration
+  and rearming are serialized, and the previous user action is returned.
+  Thread-local hardware-exception actions are not POSIX-equivalent and fail
+  with `ENOTSUP`, as do unsupported masks/flags.
 - Imported `environ == NULL` remains an inheritance sentinel, not a mutable
   environment array. setenv rejects empty values (`ENOTSUP`) because UCRT
   getenv cannot distinguish them from removal; nonempty values/unsetenv propagate
@@ -205,6 +211,22 @@ and C++17 with exceptions for `posix.cpp`, `socket.cpp`, and `spawn.cpp`. Compil
 DS4 C sources and `tests/test_win32_posix.c` as C, not C++. Link the ARM64 C++
 runtime plus `Kernel32.lib`, `Ws2_32.lib`, and `Psapi.lib`; other native C helpers
 may have their own library requirements.
+
+Embed `tools/windows/ds4.manifest` to select UTF-8 for native narrow argv and
+environment conversion. Wide process creation alone cannot preserve Unicode
+when the child UCRT narrows its command line through legacy ACP 1252.
+The spawn regression checks the actual child's BMP/supplementary UTF-8 argv,
+not merely the parent's wide command-line construction.
+
+The frontends explicitly initialize console output before installing their
+application signal handlers. `platform.c` captures both output modes before
+changing either (stdout/stderr may share a buffer), enables UTF-8/VT output,
+and restores the original code page/modes after flushing buffered output at
+normal exit. A native termination fallback restores them on unhandled console
+control events; application-handled cancellation keeps the live console
+configured. Redirected streams are untouched. Native console regressions verify
+actual Unicode glyphs, ANSI color attributes, and restoration from CP437 with
+VT initially disabled.
 
 `tests/test_win32_posix.c` includes the socket/spawn C cases. It exercises
 concurrent positional reads/writes and a live sequential stream, short reads and

@@ -13,10 +13,10 @@ unit-test coverage, not a requirement to run the full model on the CPU.
 Distributed inference, RDMA, and multi-GPU Windows support are deferred. Their
 existing Linux/macOS paths must not regress.
 
-This is a plan, not a declaration of Windows support. No native ds4 Windows
-build has been demonstrated yet.
+The experimental native CPU/CUDA development milestone is now demonstrated.
+Recorded evidence and support boundaries are in [WINDOWS.md](WINDOWS.md).
 
-## Current checkout and machine
+## Initial checkout and machine inventory
 
 - Checkout: `C:/Users/dwall/repos/ds4`.
 - Upstream remote: `origin`, `https://github.com/antirez/ds4.git`.
@@ -127,7 +127,7 @@ A working C-callable interface alone does not satisfy the no-C++ rule.
       attributes commit if needed without changing reference payload bytes.
 - [x] Keep build products, downloaded models, and large logs outside Git.
 - [x] Record imported revisions and local modifications in a provenance file.
-- [ ] Push `windows-dev` to the fork when ready; do not push to upstream.
+- [x] Push `windows-dev` to the fork when ready; do not push to upstream.
 
 Periodically integrate upstream changes at known-good checkpoints. Avoid
 mandatory daily rebases through broken work. Preserve milestone commits/tags
@@ -188,8 +188,8 @@ offset, and length alignment; OVERLAPPED I/O needs correct completion handling.
 - [x] Run startup/help checks and suitable model-independent tests.
 - [x] Exercise tokenizer, prompt rendering, GGUF parsing, and KV serialization
       wherever these can be isolated from full-model execution.
-- [ ] Check that the existing Linux CPU build still compiles, using a suitable
-      Linux environment when available.
+- [x] Check that the existing Linux CPU build still compiles, using a suitable
+      Linux environment when available. Fork CI also passed macOS CPU/frontends.
 
 **Exit:** a reproducible Windows CPU build and a documented passing test subset.
 Full 81 GiB CPU inference is not an exit requirement.
@@ -220,12 +220,12 @@ Full 81 GiB CPU inference is not an exit requirement.
       `/proc/self/fd` assumptions where they occur.
 - [x] Validate staging-buffer lifetime, alignment, partial reads, prefetch,
       cancellation, and overlap with GPU work.
-- [ ] Compare cached random reads and appropriately aligned unbuffered reads.
+- [x] Compare cached random reads and appropriately aligned unbuffered reads.
       Treat bubo's `O_CONCURRENT_RANDOM` as a candidate, not a proven winner here.
-- [ ] Test explicit low expert-cache budgets so streaming is exercised even if
+- [x] Test explicit low expert-cache budgets so streaming is exercised even if
       much of the chosen model fits in reserved GPU memory.
-- [ ] Measure memory, disk traffic, prefill, and decode across context sizes.
-- [ ] Check output correctness against the non-streaming path.
+- [x] Measure memory, disk traffic, prefill, and decode across context sizes.
+- [x] Check output correctness against the non-streaming path.
 
 **Exit:** correct, bounded-memory streaming with measured performance. Set
 performance targets from actual baselines, not an arbitrary WSL-relative limit.
@@ -238,24 +238,30 @@ performance targets from actual baselines, not an arbitrary WSL-relative limit.
 - [x] Port process spawning, quoting, environment handling, inherited handles,
       child cleanup, and exit-status reporting.
 - [x] Add Windows console handling for the interactive CLI.
-- [ ] Test instance locks, KV persistence, restart/resume, API streaming, tool
+- [x] Test instance locks, KV persistence, restart/resume, API streaming, tool
       calls, and intentional client disconnects.
-- [ ] Port and run the applicable server/agent tests; document exclusions.
+- [x] Port and run the applicable server/agent tests; document exclusions.
 
 **Exit:** usable local CLI/server/agent with reliable process cleanup.
 
 ### Phase 7 — Stabilize, trim, and prepare upstream changes
 
-- [ ] Run repeated inference, streaming, and server soak tests.
+- [x] Run repeated inference, streaming, and server soak tests. Evidence covers
+      bounded repeated generations, direct-streaming benchmark repeats, and
+      three server lifecycles; it is not a 24-hour endurance qualification.
 - [x] Add reproducible build instructions and a small environment diagnostic.
-- [ ] Remove unused compatibility code and experimental flags only after tests
-      protect the behavior being retained.
+- [x] Remove unused compatibility code and experimental flags only after tests
+      protect the behavior being retained. The unused imported HIP shim is removed.
 - [ ] Resolve the no-C++ requirement for the eventual upstream implementation.
+      This remains an upstream-only gate under the approved temporary exception.
 - [x] Preserve all applicable third-party notices; trimming does not remove
       attribution obligations for retained derived code.
 - [ ] Obtain Linux/macOS backend checks and before/after benchmarks as required
       by `CONTRIBUTING.md`; clearly label anything not tested.
+      Linux/macOS CPU CI passed; fresh Linux CUDA/macOS Metal GPU runs and their
+      before/after performance comparisons remain unverified.
 - [ ] Ask before running distributed tests or changing shared GPU services.
+      Conditional approval gate: neither was run or changed.
 - [ ] Discuss scope with upstream, then extract reviewable PRs from the working
       fork. Keep platform support and performance experiments separable.
 
@@ -282,8 +288,11 @@ large models into WSL until that test route is justified.
 - Relevant benchmark CSVs and resource measurements for hot-path changes.
 - A known-good commit or tag before integrating upstream changes.
 
-Native milestone: ARM64 CPU frontends, compatibility regressions, CUDA
-synthetic numerical tests, official continuations, and the frozen Metal golden
-comparison pass. Commands, versions, resource measurements, approval decisions,
-and the fixture-byte audit are recorded in [WINDOWS.md](WINDOWS.md).
-Remaining live lifecycle, benchmark, soak, and upstream gates stay unchecked.
+Native milestone: all five ARM64 CPU/CUDA frontends, compatibility regressions,
+CUDA numerical tests, official continuations, and the frozen Metal golden
+comparison pass. Resident/buffered/direct streaming measurements and logit
+comparisons, real console/TUI interaction, server persistence/recovery, and a
+model-driven agent tool loop also pass. Commands, versions, measurements,
+approval decisions, and the fixture-byte audit are recorded in
+[WINDOWS.md](WINDOWS.md). Remaining unchecked items are upstream-only or
+conditional authorization gates, not claims of completed GPU baseline testing.

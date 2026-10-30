@@ -105,7 +105,9 @@ def main():
     def link(name, objects, extra=()):
         exe = out / (name + ".exe")
         run([clang, "--target=aarch64-pc-windows-msvc", "/nologo", "/MD", *objects,
-             "/Fe" + str(exe), "/link", "/MACHINE:ARM64", "/STACK:8388608", *libs, *extra], env, out)
+             "/Fe" + str(exe), "/link", "/MACHINE:ARM64", "/STACK:8388608",
+             "/MANIFEST:EMBED", "/MANIFESTINPUT:" + str(ROOT / "tools/windows/ds4.manifest"),
+             *libs, *extra], env, out)
         require_arm64(exe)
         return exe
 

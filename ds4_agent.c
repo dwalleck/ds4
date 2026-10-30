@@ -8,6 +8,9 @@
 #include "ds4_tp.h"
 #include "ds4_web.h"
 #include "linenoise.h"
+#ifdef _WIN32
+#include "compat/win32/platform.h"
+#endif
 
 #include <errno.h>
 #include <ctype.h>
@@ -13845,6 +13848,12 @@ static int run_agent(ds4_engine *engine, agent_config *cfg) {
 
 #ifndef DS4_AGENT_TEST_NO_MAIN
 int main(int argc, char **argv) {
+#ifdef _WIN32
+    if (ds4_win32_console_init()) {
+        perror("ds4-agent: console initialization");
+        return 1;
+    }
+#endif
     agent_config cfg = parse_options(argc, argv);
     if (cfg.chdir_path) {
         struct stat st;

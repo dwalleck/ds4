@@ -3,6 +3,9 @@
 #include "ds4_gpu_args.h"
 #include "ds4_help.h"
 #include "ds4_tp.h"
+#ifdef _WIN32
+#include "compat/win32/platform.h"
+#endif
 
 /* Purpose-built throughput benchmark.
  *
@@ -623,6 +626,12 @@ static void close_engine(ds4_engine *engine, ds4_tp *tp) {
 }
 
 int main(int argc, char **argv) {
+#ifdef _WIN32
+    if (ds4_win32_console_init()) {
+        perror("ds4-bench: console initialization");
+        return 1;
+    }
+#endif
     bench_config cfg = parse_options(argc, argv);
 
     /* Hint the packer at the largest ctx this bench run will exercise
